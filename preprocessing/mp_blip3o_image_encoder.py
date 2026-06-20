@@ -350,45 +350,69 @@ def upload_with_retry(
                 raise
 
 
-def flush_accumulated_rows(
-    output_dir: str,
+def build_parquet_schema() -> pa.Schema:
+    flat_dim = 1024 * 768
+    return pa.schema(
+        [
+            ("patch_tokens", pa.list_(pa.float32(), flat_dim)),
+            ("caption", pa.string()),
+            ("sample_id", pa.string()),
+        ]
+    )
+
+
+def patch_batch_to_table(
+    patch_tokens_cpu: torch.Tensor,
+    captions: List[str],
+    sample_ids: List[str],
+) -> pa.Table:
+    if patch_tokens_cpu.ndim != 3:
+        raise RuntimeError(f"Expected 3D tensor for parquet conversion, got shape={tuple(patch_tokens_cpu.shape)}")
+
+    batch_size = patch_tokens_cpu.shape[0]
+    flat_dim = patch_tokens_cpu.shape[1] * patch_tokens_cpu.shape[2]
+
+    # Convert one batch at a time to avoid large Python object allocations.
+    flat_fp32 = patch_tokens_cpu.to(dtype=torch.float32).contiguous().view(batch_size, flat_dim)
+    values = pa.array(flat_fp32.numpy().reshape(-1), type=pa.float32())
+    patch_array = pa.FixedSizeListArray.from_arrays(values, flat_dim)
+
+    return pa.Table.from_arrays(
+        [
+            patch_array,
+            pa.array(captions, type=pa.string()),
+            pa.array(sample_ids, type=pa.string()),
+        ],
+        names=["patch_tokens", "caption", "sample_id"],
+    )
+
+
+def open_parquet_writer(output_dir: str, local_rank: int, flush_idx: int) -> Tuple[pq.ParquetWriter, str]:
+    out_path = os.path.join(output_dir, f"rank{local_rank:02d}_flush{flush_idx:07d}.parquet")
+    writer = pq.ParquetWriter(out_path, schema=build_parquet_schema(), compression="zstd")
+    return writer, out_path
+
+
+def maybe_upload_file(
     local_rank: int,
-    flush_idx: int,
-    patch_buffer: List[torch.Tensor],
-    caption_buffer: List[str],
-    sample_id_buffer: List[str],
+    out_path: str,
     api: Any,
     repo_id: str,
     prefix: str,
     rank_stagger_seconds: float,
-) -> str:
-    patch_cat = torch.cat(patch_buffer, dim=0).contiguous()
-    rows_patch: List[List[float]] = [patch_cat[i].view(-1).tolist() for i in range(patch_cat.shape[0])]
-
-    table = pa.Table.from_pydict(
-        {
-            "patch_tokens": rows_patch,
-            "caption": caption_buffer,
-            "sample_id": sample_id_buffer,
-        }
-    )
-
-    out_path = os.path.join(output_dir, f"rank{local_rank:02d}_flush{flush_idx:07d}.parquet")
-    pq.write_table(table, out_path, compression="zstd")
-
-    if api is not None:
-        # Stagger uploads by rank to avoid simultaneous Hub commits.
-        if local_rank > 0:
-            time.sleep(local_rank * rank_stagger_seconds)
-        path_in_repo = f"{prefix}/{os.path.basename(out_path)}"
-        upload_with_retry(api=api, repo_id=repo_id, path_in_repo=path_in_repo, local_file=out_path)
-        if should_delete_local_after_upload():
-            try:
-                os.remove(out_path)
-            except OSError:
-                pass
-
-    return out_path
+) -> None:
+    if api is None:
+        return
+    # Stagger uploads by rank to avoid simultaneous Hub commits.
+    if local_rank > 0:
+        time.sleep(local_rank * rank_stagger_seconds)
+    path_in_repo = f"{prefix}/{os.path.basename(out_path)}"
+    upload_with_retry(api=api, repo_id=repo_id, path_in_repo=path_in_repo, local_file=out_path)
+    if should_delete_local_after_upload():
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
 
 
 def compile_model_or_raise(model: torch.nn.Module, rank: int) -> torch.nn.Module:
@@ -412,7 +436,7 @@ def run_worker(
     output_dir: str,
     global_row_limit: int,
     upload_repo_id: str,
-    upload_every_chunks: int,
+    upload_every_rows: int,
     upload_prefix: str,
     result_queue: Any,
 ) -> None:
@@ -480,7 +504,6 @@ def run_worker(
         drop_last=False,
     )
 
-    upload_every_rows = upload_every_chunks  # passed as row threshold from main
     hub_api = None
 
     if upload_every_rows > 0:
@@ -495,10 +518,9 @@ def run_worker(
             )
         hub_api = HuggingFaceHubAPI(token=hf_token)
 
-    patch_buffer: List[torch.Tensor] = []
-    caption_buffer: List[str] = []
-    sample_id_buffer: List[str] = []
-    buffered_rows = 0
+    writer: pq.ParquetWriter | None = None
+    current_out_path = ""
+    rows_in_current_file = 0
     flush_idx = 0
 
     processed = 0
@@ -542,55 +564,59 @@ def run_worker(
             with autocast_ctx:
                 patch_tokens = infer_patch_tokens(model, pixel_values)
 
-            # Accumulate rows into buffer.
-            patch_buffer.append(patch_tokens.cpu())
-            caption_buffer.extend(captions)
-            sample_id_buffer.extend(sample_ids)
-            buffered_rows += len(captions)
+            if writer is None:
+                writer, current_out_path = open_parquet_writer(output_dir=output_dir, local_rank=local_rank, flush_idx=flush_idx)
+
+            patch_tokens_cpu = patch_tokens.cpu()
+            table = patch_batch_to_table(
+                patch_tokens_cpu=patch_tokens_cpu,
+                captions=captions,
+                sample_ids=sample_ids,
+            )
+            writer.write_table(table)
+
+            rows_in_current_file += len(captions)
             processed += len(captions)
             chunk_idx += 1
 
             if progress_bar is not None:
                 progress_bar.update(len(captions))
 
-            # Flush one merged parquet when row threshold is reached.
-            if upload_every_rows > 0 and buffered_rows >= upload_every_rows:
-                out_path = flush_accumulated_rows(
-                    output_dir=output_dir,
+            # Close + upload the current parquet file after the row threshold.
+            if upload_every_rows > 0 and rows_in_current_file >= upload_every_rows:
+                if writer is not None:
+                    writer.close()
+                    writer = None
+                out_path = current_out_path
+                maybe_upload_file(
                     local_rank=local_rank,
-                    flush_idx=flush_idx,
-                    patch_buffer=patch_buffer,
-                    caption_buffer=caption_buffer,
-                    sample_id_buffer=sample_id_buffer,
+                    out_path=out_path,
                     api=hub_api,
                     repo_id=upload_repo_id,
                     prefix=upload_prefix,
                     rank_stagger_seconds=15.0,
                 )
                 flush_idx += 1
-                patch_buffer, caption_buffer, sample_id_buffer, buffered_rows = [], [], [], 0
+                rows_in_current_file = 0
                 if local_rank == 0 and progress_bar is not None:
                     progress_bar.write(f"rank0 flushed ~{upload_every_rows} rows → {out_path}")
             elif local_rank == 0 and chunk_idx % 10 == 0:
                 if progress_bar is not None:
                     progress_bar.write(
-                        f"rank0 progress: chunks={chunk_idx}, rows={processed}, buffered={buffered_rows}"
+                        f"rank0 progress: chunks={chunk_idx}, rows={processed}, current_file_rows={rows_in_current_file}"
                     )
                 else:
-                    print(f"rank0 progress: chunks={chunk_idx}, rows={processed}, buffered={buffered_rows}")
+                    print(f"rank0 progress: chunks={chunk_idx}, rows={processed}, current_file_rows={rows_in_current_file}")
 
     if progress_bar is not None:
         progress_bar.close()
 
-    # Flush any remaining buffered rows at end of stream.
-    if patch_buffer:
-        flush_accumulated_rows(
-            output_dir=output_dir,
+    # Finalize and optionally upload the current parquet file.
+    if writer is not None:
+        writer.close()
+        maybe_upload_file(
             local_rank=local_rank,
-            flush_idx=flush_idx,
-            patch_buffer=patch_buffer,
-            caption_buffer=caption_buffer,
-            sample_id_buffer=sample_id_buffer,
+            out_path=current_out_path,
             api=hub_api,
             repo_id=upload_repo_id,
             prefix=upload_prefix,
@@ -628,8 +654,6 @@ def main() -> None:
 
     global_row_limit = resolve_global_row_limit(args)
     upload_repo_id, upload_every_rows, upload_prefix = resolve_hub_upload_config()
-    # Pass row threshold directly to workers; they accumulate and flush one parquet per threshold.
-    upload_every_chunks = upload_every_rows
     output_dir = build_output_dir(args.output_dir)
 
     print(f"Starting multiprocessing inference with num_procs={args.num_procs}")
@@ -654,7 +678,7 @@ def main() -> None:
             output_dir,
             global_row_limit,
             upload_repo_id,
-            upload_every_chunks,
+            upload_every_rows,
             upload_prefix,
             result_queue,
         ),
