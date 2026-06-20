@@ -436,12 +436,14 @@ def run_worker(
     chunk_idx = 0
     progress_bar = None
 
-    if local_rank == 0 and tqdm is not None:
+    if tqdm is not None:
         progress_bar = tqdm(
             total=(rank_target if rank_target > 0 else None),
-            desc="rank0 rows",
+            desc=f"rank{local_rank} rows",
             unit="rows",
             dynamic_ncols=True,
+            position=local_rank,
+            leave=True,
         )
 
     with torch.inference_mode():
@@ -498,7 +500,12 @@ def run_worker(
                     pending_uploads = []
 
             if local_rank == 0 and chunk_idx % 10 == 0:
-                print(f"rank0 progress: chunks={chunk_idx}, samples={processed}, last_file={out_path}")
+                if progress_bar is not None:
+                    progress_bar.write(
+                        f"rank0 progress: chunks={chunk_idx}, samples={processed}, last_file={out_path}"
+                    )
+                else:
+                    print(f"rank0 progress: chunks={chunk_idx}, samples={processed}, last_file={out_path}")
 
     if progress_bar is not None:
         progress_bar.close()
