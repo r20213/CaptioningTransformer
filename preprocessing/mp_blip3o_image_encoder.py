@@ -26,7 +26,7 @@ Environment variables:
     - OUTPUT_DIR: optional default for --output-dir
     - ENCODE_MAX_ROWS: optional exact global number of rows to process across all ranks
     - HF_DATASET_REPO_ID: optional dataset repo id for periodic uploads (e.g. user/repo)
-    - HF_UPLOAD_EVERY_CHUNKS: optional per-rank upload cadence (0 disables periodic upload)
+    - HF_UPLOAD_EVERY_ROWS: number of rows per rank between Hub uploads (0 = disable)
     - HF_UPLOAD_PREFIX: optional folder prefix in dataset repo (default: parquet)
     - HF_CREATE_REPO_IF_MISSING: optional bool, auto-create dataset repo when uploads are enabled (default: true)
 """
@@ -265,14 +265,14 @@ def compute_rank_target(global_limit: int, world_size: int, local_rank: int) -> 
 def resolve_hub_upload_config() -> Tuple[str, int, str]:
     repo_id = os.environ.get("HF_DATASET_REPO_ID", "").strip()
     prefix = os.environ.get("HF_UPLOAD_PREFIX", "parquet").strip() or "parquet"
-    every_raw = os.environ.get("HF_UPLOAD_EVERY_CHUNKS", "0").strip() or "0"
+    every_raw = os.environ.get("HF_UPLOAD_EVERY_ROWS", "0").strip() or "0"
     try:
-        every = int(every_raw)
+        every_rows = int(every_raw)
     except ValueError as exc:
-        raise ValueError("HF_UPLOAD_EVERY_CHUNKS must be an integer") from exc
-    if every < 0:
-        raise ValueError("HF_UPLOAD_EVERY_CHUNKS must be >= 0")
-    return repo_id, every, prefix
+        raise ValueError("HF_UPLOAD_EVERY_ROWS must be an integer") from exc
+    if every_rows < 0:
+        raise ValueError("HF_UPLOAD_EVERY_ROWS must be >= 0")
+    return repo_id, every_rows, prefix
 
 
 def should_create_repo_if_missing() -> bool:
@@ -564,7 +564,9 @@ def main() -> None:
         )
 
     global_row_limit = resolve_global_row_limit(args)
-    upload_repo_id, upload_every_chunks, upload_prefix = resolve_hub_upload_config()
+    upload_repo_id, upload_every_rows, upload_prefix = resolve_hub_upload_config()
+    # Convert user-supplied row count to chunk count using batch_size.
+    upload_every_chunks = max(1, upload_every_rows // args.batch_size) if upload_every_rows > 0 else 0
     output_dir = build_output_dir(args.output_dir)
 
     print(f"Starting multiprocessing inference with num_procs={args.num_procs}")
@@ -576,7 +578,7 @@ def main() -> None:
         ensure_dataset_repo_exists(hf_token=hf_token, repo_id=upload_repo_id)
         print(
             "Periodic Hub uploads enabled: "
-            f"every {upload_every_chunks} chunks per rank to dataset {upload_repo_id}"
+            f"every ~{upload_every_rows} rows (~{upload_every_chunks} chunks) per rank to dataset {upload_repo_id}"
         )
 
     mp.set_start_method("spawn", force=True)
