@@ -38,6 +38,7 @@ import contextlib
 import io
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -316,15 +317,15 @@ def should_delete_local_after_upload() -> bool:
     }
 
 
-def flush_periodic_uploads(
+def upload_with_retry(
     api: Any,
     repo_id: str,
-    prefix: str,
-    local_paths: List[str],
+    path_in_repo: str,
+    local_file: str,
+    max_retries: int = 6,
 ) -> None:
-    delete_local = should_delete_local_after_upload()
-    for local_file in local_paths:
-        path_in_repo = f"{prefix}/{os.path.basename(local_file)}"
+    delay = 30.0
+    for attempt in range(max_retries):
         try:
             api.upload_file(
                 path_or_fileobj=local_file,
@@ -332,16 +333,62 @@ def flush_periodic_uploads(
                 repo_id=repo_id,
                 repo_type="dataset",
             )
+            return
         except RepositoryNotFoundError as exc:
             raise RuntimeError(
                 f"Dataset repo '{repo_id}' not found during upload. "
                 "Create it first or enable HF_CREATE_REPO_IF_MISSING=1"
             ) from exc
-        if delete_local:
+        except Exception as exc:
+            msg = str(exc)
+            is_transient = any(code in msg for code in ("429", "500", "502", "503"))
+            if attempt < max_retries - 1 and is_transient:
+                wait = delay * (2 ** attempt)
+                print(f"Upload transient error ({msg[:100]}), retrying in {wait:.0f}s ...")
+                time.sleep(wait)
+            else:
+                raise
+
+
+def flush_accumulated_rows(
+    output_dir: str,
+    local_rank: int,
+    flush_idx: int,
+    patch_buffer: List[torch.Tensor],
+    caption_buffer: List[str],
+    sample_id_buffer: List[str],
+    api: Any,
+    repo_id: str,
+    prefix: str,
+    rank_stagger_seconds: float,
+) -> str:
+    patch_cat = torch.cat(patch_buffer, dim=0).contiguous()
+    rows_patch: List[List[float]] = [patch_cat[i].view(-1).tolist() for i in range(patch_cat.shape[0])]
+
+    table = pa.Table.from_pydict(
+        {
+            "patch_tokens": rows_patch,
+            "caption": caption_buffer,
+            "sample_id": sample_id_buffer,
+        }
+    )
+
+    out_path = os.path.join(output_dir, f"rank{local_rank:02d}_flush{flush_idx:07d}.parquet")
+    pq.write_table(table, out_path, compression="zstd")
+
+    if api is not None:
+        # Stagger uploads by rank to avoid simultaneous Hub commits.
+        if local_rank > 0:
+            time.sleep(local_rank * rank_stagger_seconds)
+        path_in_repo = f"{prefix}/{os.path.basename(out_path)}"
+        upload_with_retry(api=api, repo_id=repo_id, path_in_repo=path_in_repo, local_file=out_path)
+        if should_delete_local_after_upload():
             try:
-                os.remove(local_file)
+                os.remove(out_path)
             except OSError:
                 pass
+
+    return out_path
 
 
 def compile_model_or_raise(model: torch.nn.Module, rank: int) -> torch.nn.Module:
@@ -433,13 +480,13 @@ def run_worker(
         drop_last=False,
     )
 
+    upload_every_rows = upload_every_chunks  # passed as row threshold from main
     hub_api = None
-    pending_uploads: List[str] = []
 
-    if upload_every_chunks > 0:
+    if upload_every_rows > 0:
         if not upload_repo_id:
             raise ValueError(
-                "HF_UPLOAD_EVERY_CHUNKS is set, but HF_DATASET_REPO_ID is missing. "
+                "HF_UPLOAD_EVERY_ROWS is set, but HF_DATASET_REPO_ID is missing. "
                 "Set HF_DATASET_REPO_ID like 'username/dataset-repo'."
             )
         if HuggingFaceHubAPI is None:
@@ -447,6 +494,12 @@ def run_worker(
                 "huggingface_hub is required for periodic uploads. Install it or disable uploads."
             )
         hub_api = HuggingFaceHubAPI(token=hf_token)
+
+    patch_buffer: List[torch.Tensor] = []
+    caption_buffer: List[str] = []
+    sample_id_buffer: List[str] = []
+    buffered_rows = 0
+    flush_idx = 0
 
     processed = 0
     chunk_idx = 0
@@ -489,49 +542,59 @@ def run_worker(
             with autocast_ctx:
                 patch_tokens = infer_patch_tokens(model, pixel_values)
 
-            out_path = write_parquet_chunk(
-                output_dir=output_dir,
-                local_rank=local_rank,
-                chunk_idx=chunk_idx,
-                patch_tokens=patch_tokens,
-                captions=captions,
-                sample_ids=sample_ids,
-            )
-
+            # Accumulate rows into buffer.
+            patch_buffer.append(patch_tokens.cpu())
+            caption_buffer.extend(captions)
+            sample_id_buffer.extend(sample_ids)
+            buffered_rows += len(captions)
             processed += len(captions)
             chunk_idx += 1
 
             if progress_bar is not None:
                 progress_bar.update(len(captions))
 
-            if hub_api is not None and upload_every_chunks > 0:
-                pending_uploads.append(out_path)
-                if len(pending_uploads) >= upload_every_chunks:
-                    flush_periodic_uploads(
-                        api=hub_api,
-                        repo_id=upload_repo_id,
-                        prefix=upload_prefix,
-                        local_paths=pending_uploads,
-                    )
-                    pending_uploads = []
-
-            if local_rank == 0 and chunk_idx % 10 == 0:
+            # Flush one merged parquet when row threshold is reached.
+            if upload_every_rows > 0 and buffered_rows >= upload_every_rows:
+                out_path = flush_accumulated_rows(
+                    output_dir=output_dir,
+                    local_rank=local_rank,
+                    flush_idx=flush_idx,
+                    patch_buffer=patch_buffer,
+                    caption_buffer=caption_buffer,
+                    sample_id_buffer=sample_id_buffer,
+                    api=hub_api,
+                    repo_id=upload_repo_id,
+                    prefix=upload_prefix,
+                    rank_stagger_seconds=15.0,
+                )
+                flush_idx += 1
+                patch_buffer, caption_buffer, sample_id_buffer, buffered_rows = [], [], [], 0
+                if local_rank == 0 and progress_bar is not None:
+                    progress_bar.write(f"rank0 flushed ~{upload_every_rows} rows → {out_path}")
+            elif local_rank == 0 and chunk_idx % 10 == 0:
                 if progress_bar is not None:
                     progress_bar.write(
-                        f"rank0 progress: chunks={chunk_idx}, samples={processed}, last_file={out_path}"
+                        f"rank0 progress: chunks={chunk_idx}, rows={processed}, buffered={buffered_rows}"
                     )
                 else:
-                    print(f"rank0 progress: chunks={chunk_idx}, samples={processed}, last_file={out_path}")
+                    print(f"rank0 progress: chunks={chunk_idx}, rows={processed}, buffered={buffered_rows}")
 
     if progress_bar is not None:
         progress_bar.close()
 
-    if hub_api is not None and pending_uploads:
-        flush_periodic_uploads(
+    # Flush any remaining buffered rows at end of stream.
+    if patch_buffer:
+        flush_accumulated_rows(
+            output_dir=output_dir,
+            local_rank=local_rank,
+            flush_idx=flush_idx,
+            patch_buffer=patch_buffer,
+            caption_buffer=caption_buffer,
+            sample_id_buffer=sample_id_buffer,
             api=hub_api,
             repo_id=upload_repo_id,
             prefix=upload_prefix,
-            local_paths=pending_uploads,
+            rank_stagger_seconds=15.0,
         )
 
     result_queue.put(processed)
@@ -565,8 +628,8 @@ def main() -> None:
 
     global_row_limit = resolve_global_row_limit(args)
     upload_repo_id, upload_every_rows, upload_prefix = resolve_hub_upload_config()
-    # Convert user-supplied row count to chunk count using batch_size.
-    upload_every_chunks = max(1, upload_every_rows // args.batch_size) if upload_every_rows > 0 else 0
+    # Pass row threshold directly to workers; they accumulate and flush one parquet per threshold.
+    upload_every_chunks = upload_every_rows
     output_dir = build_output_dir(args.output_dir)
 
     print(f"Starting multiprocessing inference with num_procs={args.num_procs}")
@@ -574,11 +637,11 @@ def main() -> None:
 
     if global_row_limit > 0:
         print(f"Exact global row limit enabled via ENCODE_MAX_ROWS/--max-samples: {global_row_limit}")
-    if upload_every_chunks > 0:
+    if upload_every_rows > 0:
         ensure_dataset_repo_exists(hf_token=hf_token, repo_id=upload_repo_id)
         print(
             "Periodic Hub uploads enabled: "
-            f"every ~{upload_every_rows} rows (~{upload_every_chunks} chunks) per rank to dataset {upload_repo_id}"
+            f"every ~{upload_every_rows} rows per rank → 1 merged parquet file → {upload_repo_id}"
         )
 
     mp.set_start_method("spawn", force=True)
