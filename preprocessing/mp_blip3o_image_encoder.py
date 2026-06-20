@@ -306,12 +306,23 @@ def ensure_dataset_repo_exists(hf_token: str, repo_id: str) -> None:
         raise RuntimeError(f"Unable to validate dataset repo '{repo_id}': {exc}") from exc
 
 
+def should_delete_local_after_upload() -> bool:
+    return os.environ.get("HF_DELETE_LOCAL_AFTER_UPLOAD", "1").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
+
+
 def flush_periodic_uploads(
     api: Any,
     repo_id: str,
     prefix: str,
     local_paths: List[str],
 ) -> None:
+    delete_local = should_delete_local_after_upload()
     for local_file in local_paths:
         path_in_repo = f"{prefix}/{os.path.basename(local_file)}"
         try:
@@ -326,6 +337,11 @@ def flush_periodic_uploads(
                 f"Dataset repo '{repo_id}' not found during upload. "
                 "Create it first or enable HF_CREATE_REPO_IF_MISSING=1"
             ) from exc
+        if delete_local:
+            try:
+                os.remove(local_file)
+            except OSError:
+                pass
 
 
 def compile_model_or_raise(model: torch.nn.Module, rank: int) -> torch.nn.Module:
