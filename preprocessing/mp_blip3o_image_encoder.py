@@ -28,6 +28,7 @@ Environment variables:
     - HF_DATASET_REPO_ID: optional dataset repo id for periodic uploads (e.g. user/repo)
     - HF_UPLOAD_EVERY_CHUNKS: optional per-rank upload cadence (0 disables periodic upload)
     - HF_UPLOAD_PREFIX: optional folder prefix in dataset repo (default: parquet)
+    - HF_CREATE_REPO_IF_MISSING: optional bool, auto-create dataset repo when uploads are enabled (default: true)
 """
 
 from __future__ import annotations
@@ -61,6 +62,11 @@ try:
     from huggingface_hub import HfApi as HuggingFaceHubAPI
 except Exception:
     HuggingFaceHubAPI = None
+
+try:
+    from huggingface_hub.errors import RepositoryNotFoundError
+except Exception:
+    RepositoryNotFoundError = Exception
 
 try:
     from tqdm.auto import tqdm
@@ -269,6 +275,37 @@ def resolve_hub_upload_config() -> Tuple[str, int, str]:
     return repo_id, every, prefix
 
 
+def should_create_repo_if_missing() -> bool:
+    return os.environ.get("HF_CREATE_REPO_IF_MISSING", "1").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
+
+
+def ensure_dataset_repo_exists(hf_token: str, repo_id: str) -> None:
+    if not repo_id:
+        return
+    if HuggingFaceHubAPI is None:
+        raise ImportError("huggingface_hub is required for periodic uploads. Install it or disable uploads.")
+
+    api = HuggingFaceHubAPI(token=hf_token)
+    create_if_missing = should_create_repo_if_missing()
+    try:
+        api.repo_info(repo_id=repo_id, repo_type="dataset")
+        return
+    except RepositoryNotFoundError:
+        if not create_if_missing:
+            raise RuntimeError(
+                f"Dataset repo '{repo_id}' does not exist and HF_CREATE_REPO_IF_MISSING is disabled"
+            )
+        api.create_repo(repo_id=repo_id, repo_type="dataset", exist_ok=True)
+    except Exception as exc:
+        raise RuntimeError(f"Unable to validate dataset repo '{repo_id}': {exc}") from exc
+
+
 def flush_periodic_uploads(
     api: Any,
     repo_id: str,
@@ -277,12 +314,18 @@ def flush_periodic_uploads(
 ) -> None:
     for local_file in local_paths:
         path_in_repo = f"{prefix}/{os.path.basename(local_file)}"
-        api.upload_file(
-            path_or_fileobj=local_file,
-            path_in_repo=path_in_repo,
-            repo_id=repo_id,
-            repo_type="dataset",
-        )
+        try:
+            api.upload_file(
+                path_or_fileobj=local_file,
+                path_in_repo=path_in_repo,
+                repo_id=repo_id,
+                repo_type="dataset",
+            )
+        except RepositoryNotFoundError as exc:
+            raise RuntimeError(
+                f"Dataset repo '{repo_id}' not found during upload. "
+                "Create it first or enable HF_CREATE_REPO_IF_MISSING=1"
+            ) from exc
 
 
 def compile_model_or_raise(model: torch.nn.Module, rank: int) -> torch.nn.Module:
@@ -389,18 +432,6 @@ def run_worker(
             )
         hub_api = HuggingFaceHubAPI(token=hf_token)
 
-    if local_rank == 0:
-        print(f"Writing parquet shards to: {output_dir}")
-        if global_row_limit > 0:
-            print(
-                f"Exact global row limit enabled via ENCODE_MAX_ROWS/--max-samples: {global_row_limit}"
-            )
-        if upload_every_chunks > 0:
-            print(
-                "Periodic Hub uploads enabled: "
-                f"every {upload_every_chunks} chunks per rank to dataset {upload_repo_id}"
-            )
-
     processed = 0
     chunk_idx = 0
     progress_bar = None
@@ -489,6 +520,14 @@ def main() -> None:
     if not hf_token:
         raise EnvironmentError("HF_TOKEN environment variable is required")
 
+    # This script already manages multiprocessing. Running it under torchrun will oversubscribe processes.
+    torchrun_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if torchrun_world_size > 1:
+        raise RuntimeError(
+            "This script must not be launched with torchrun. "
+            "Run it directly: python preprocessing/mp_blip3o_image_encoder.py"
+        )
+
     if args.num_procs <= 0:
         raise ValueError("--num-procs must be >= 1")
 
@@ -511,6 +550,7 @@ def main() -> None:
     if global_row_limit > 0:
         print(f"Exact global row limit enabled via ENCODE_MAX_ROWS/--max-samples: {global_row_limit}")
     if upload_every_chunks > 0:
+        ensure_dataset_repo_exists(hf_token=hf_token, repo_id=upload_repo_id)
         print(
             "Periodic Hub uploads enabled: "
             f"every {upload_every_chunks} chunks per rank to dataset {upload_repo_id}"
