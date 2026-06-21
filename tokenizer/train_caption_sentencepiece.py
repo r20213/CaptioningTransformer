@@ -13,12 +13,17 @@ Pipeline:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import re
+import shutil
 from pathlib import Path
 
 from datasets import load_dataset
-from huggingface_hub import login
+from huggingface_hub import HfApi, login
+from huggingface_hub.errors import RepositoryNotFoundError
+import pyarrow as pa
+import pyarrow.parquet as pq
 from tqdm.auto import tqdm
 
 import sentencepiece as spm
@@ -87,7 +92,22 @@ def parse_args() -> argparse.Namespace:
         "--max-rows",
         type=int,
         default=int(os.environ.get("TOKENIZER_MAX_ROWS", "10000").strip() or "10000"),
-        help="Rows to materialize from source split (0 = all rows)",
+        help="Rows to process from source split (0 = all rows)",
+    )
+    parser.add_argument(
+        "--text-dataset-repo-id",
+        type=str,
+        default=(
+            os.environ.get("TOKENIZER_TEXT_DATASET_REPO_ID", "").strip()
+            or os.environ.get("HF_DATASET_REPO_ID", "").strip()
+        ),
+        help="Hub dataset repo to store/reuse text-only split dataset",
+    )
+    parser.add_argument(
+        "--upload-shard-rows",
+        type=int,
+        default=int(os.environ.get("TOKENIZER_UPLOAD_SHARD_ROWS", "50000").strip() or "50000"),
+        help="Rows per local parquet shard before upload",
     )
     return parser.parse_args()
 
@@ -103,6 +123,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--seed must be >= 0")
     if args.max_rows < 0:
         raise ValueError("--max-rows must be >= 0")
+    if not args.text_dataset_repo_id:
+        raise ValueError("--text-dataset-repo-id is required (or set TOKENIZER_TEXT_DATASET_REPO_ID)")
+    if args.upload_shard_rows <= 0:
+        raise ValueError("--upload-shard-rows must be > 0")
 
 
 def authenticate_hub(hf_token: str) -> None:
@@ -112,37 +136,126 @@ def authenticate_hub(hf_token: str) -> None:
     login(token=hf_token, add_to_git_credential=False)
 
 
-def materialize_dataset(args: argparse.Namespace, hf_token: str):
-    print(f"Loading dataset {args.dataset_id} with streaming=False and text column only...")
-    dataset = load_dataset(
+def _hash_split(text: str) -> str:
+    digest = hashlib.blake2b(text.encode("utf-8", errors="ignore"), digest_size=8).digest()
+    bucket = int.from_bytes(digest, "big") % 100
+    if bucket < 90:
+        return "train"
+    if bucket < 95:
+        return "validation"
+    return "test"
+
+
+def _flush_shard(base_dir: Path, split_name: str, shard_idx: int, text_column: str, rows: list[str]) -> None:
+    if not rows:
+        return
+    split_dir = base_dir / split_name
+    split_dir.mkdir(parents=True, exist_ok=True)
+    shard_path = split_dir / f"part-{shard_idx:06d}.parquet"
+    table = pa.Table.from_pydict({text_column: rows})
+    pq.write_table(table, shard_path, compression="zstd")
+
+
+def text_split_dataset_exists(repo_id: str, hf_token: str) -> bool:
+    try:
+        probe = load_dataset(repo_id, split="train", streaming=True, token=hf_token)
+        iterator = iter(probe)
+        first_row = next(iterator, None)
+        return first_row is not None
+    except Exception:
+        return False
+
+
+def build_and_push_text_split_dataset(args: argparse.Namespace, hf_token: str, output_dir: Path) -> None:
+    print(
+        "Building text-only split dataset from source stream "
+        f"and pushing to Hub repo {args.text_dataset_repo_id}..."
+    )
+
+    stream = load_dataset(
         args.dataset_id,
         split=args.source_split,
-        streaming=False,
+        streaming=True,
         token=hf_token,
     ).select_columns([args.text_column])
 
-    if args.max_rows > 0:
-        keep = min(args.max_rows, len(dataset))
-        dataset = dataset.select(range(keep))
+    upload_root = output_dir / "text_splits_upload"
+    if upload_root.exists():
+        shutil.rmtree(upload_root)
+    upload_root.mkdir(parents=True, exist_ok=True)
 
-    print(f"Materialized rows: {len(dataset)}")
-    return dataset
+    buffers = {"train": [], "validation": [], "test": []}
+    shard_counts = {"train": 0, "validation": 0, "test": 0}
+    row_counts = {"train": 0, "validation": 0, "test": 0}
+
+    processed = 0
+    progress_total = args.max_rows if args.max_rows > 0 else None
+    with tqdm(total=progress_total, desc="Streaming source rows") as pbar:
+        for row in stream:
+            text_raw = row.get(args.text_column, "")
+            if text_raw is None:
+                continue
+            text = str(text_raw)
+            if not text:
+                continue
+
+            split_name = _hash_split(text)
+            buffers[split_name].append(text)
+            row_counts[split_name] += 1
+            processed += 1
+            pbar.update(1)
+
+            if len(buffers[split_name]) >= args.upload_shard_rows:
+                _flush_shard(
+                    base_dir=upload_root,
+                    split_name=split_name,
+                    shard_idx=shard_counts[split_name],
+                    text_column=args.text_column,
+                    rows=buffers[split_name],
+                )
+                shard_counts[split_name] += 1
+                buffers[split_name] = []
+
+            if args.max_rows > 0 and processed >= args.max_rows:
+                break
+
+    for split_name in ["train", "validation", "test"]:
+        if buffers[split_name]:
+            _flush_shard(
+                base_dir=upload_root,
+                split_name=split_name,
+                shard_idx=shard_counts[split_name],
+                text_column=args.text_column,
+                rows=buffers[split_name],
+            )
+            shard_counts[split_name] += 1
+            buffers[split_name] = []
+
+    print(
+        "Prepared split dataset rows: "
+        f"train={row_counts['train']} validation={row_counts['validation']} test={row_counts['test']}"
+    )
+
+    api = HfApi(token=hf_token)
+    try:
+        api.repo_info(repo_id=args.text_dataset_repo_id, repo_type="dataset")
+    except RepositoryNotFoundError:
+        api.create_repo(repo_id=args.text_dataset_repo_id, repo_type="dataset", exist_ok=True)
+
+    api.upload_folder(
+        folder_path=str(upload_root),
+        repo_id=args.text_dataset_repo_id,
+        repo_type="dataset",
+        path_in_repo="",
+    )
+
+    print(f"Uploaded text-only split dataset to {args.text_dataset_repo_id}")
 
 
-def split_dataset(dataset, seed: int):
-    # Stage-1 split requested by user prompt.
-    test_split = dataset.train_test_split(test_size=0.1, seed=seed)
-    train_val_split = test_split["train"].train_test_split(test_size=0.1, seed=seed)
-    train_dataset = train_val_split["train"]
-    val_dataset = train_val_split["test"]
-    test_dataset = test_split["test"]
-    return train_dataset, val_dataset, test_dataset
-
-
-def write_training_corpus(train_dataset, text_column: str, corpus_path: Path) -> int:
+def write_training_corpus(train_stream, text_column: str, corpus_path: Path) -> int:
     rows_written = 0
     with corpus_path.open("w", encoding="utf-8") as f:
-        for row in tqdm(train_dataset, total=len(train_dataset), desc="Writing train corpus"):
+        for row in tqdm(train_stream, desc="Writing train corpus"):
             text_raw = row.get(text_column, "")
             if text_raw is None:
                 continue
@@ -219,16 +332,20 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    dataset = materialize_dataset(args, hf_token)
-    train_dataset, val_dataset, test_dataset = split_dataset(dataset, args.seed)
+    if text_split_dataset_exists(args.text_dataset_repo_id, hf_token):
+        print(f"Using existing text-only split dataset from Hub: {args.text_dataset_repo_id}")
+    else:
+        build_and_push_text_split_dataset(args, hf_token, output_dir)
 
-    print(
-        "Deterministic split sizes: "
-        f"train={len(train_dataset)} val={len(val_dataset)} test={len(test_dataset)}"
-    )
+    train_stream = load_dataset(
+        args.text_dataset_repo_id,
+        split="train",
+        streaming=True,
+        token=hf_token,
+    ).select_columns([args.text_column])
 
     corpus_path = output_dir / "spm_train_corpus.txt"
-    rows_written = write_training_corpus(train_dataset, args.text_column, corpus_path)
+    rows_written = write_training_corpus(train_stream, args.text_column, corpus_path)
     print(f"Training corpus rows written: {rows_written}")
 
     print("Training SentencePiece unigram model...")
