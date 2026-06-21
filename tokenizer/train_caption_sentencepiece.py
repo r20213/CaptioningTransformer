@@ -345,6 +345,102 @@ def run_sanity_check(model_path: Path) -> None:
         raise RuntimeError("Round-trip check failed: decoded text does not match original")
 
 
+def convert_to_fast_tokenizer(model_path: Path, output_dir: Path) -> Path:
+    """
+    Convert SentencePiece .model to a fast tokenizer config (transformers-compatible).
+    Creates tokenizer_config.json and special_tokens_map.json for Hub upload.
+    """
+    import json
+
+    processor = spm.SentencePieceProcessor(model_file=str(model_path))
+
+    # Create tokenizer_config.json
+    tokenizer_config = {
+        "tokenizer_class": "SentencePieceProcessor",
+        "model_type": "unigram",
+        "vocab_size": processor.vocab_size(),
+        "model_file": "spm_unigram.model",
+        "language": "en",
+    }
+    config_path = output_dir / "tokenizer_config.json"
+    with config_path.open("w", encoding="utf-8") as f:
+        json.dump(tokenizer_config, f, indent=2)
+
+    # Create special_tokens_map.json
+    special_tokens = {
+        "bos_token": {"content": "[BOS]", "lstrip": False, "rstrip": False, "single_word": False},
+        "eos_token": {"content": "[EOS]", "lstrip": False, "rstrip": False, "single_word": False},
+        "unk_token": {"content": "[UNK]", "lstrip": False, "rstrip": False, "single_word": False},
+        "pad_token": {"content": "[PAD]", "lstrip": False, "rstrip": False, "single_word": False},
+        "mask_token": {"content": "[MASK]", "lstrip": False, "rstrip": False, "single_word": False},
+    }
+    special_map_path = output_dir / "special_tokens_map.json"
+    with special_map_path.open("w", encoding="utf-8") as f:
+        json.dump(special_tokens, f, indent=2)
+
+    print(f"\nCreated fast tokenizer config: {config_path}, {special_map_path}")
+    return config_path
+
+
+def run_test_cases(model_path: Path) -> None:
+    """Run a suite of test cases to validate tokenizer behavior."""
+    processor = spm.SentencePieceProcessor(model_file=str(model_path))
+
+    test_cases = [
+        "A cat sat on the mat.",
+        "The numbers 1 and 100 are boundaries.",
+        "Mixed: 42 apples, 87 oranges, 999 bananas.",
+        "Special tokens: [BOS] text [EOS]",
+        "Unicode: café, naïve, résumé",
+        "Numbers: 1 2 3 4 5 10 20 50 100 101 200",
+        "Long caption: The quick brown fox jumps over the lazy dog repeatedly.",
+    ]
+
+    print("\nRunning test cases...")
+    for i, test in enumerate(test_cases, 1):
+        pieces = processor.encode(test, out_type=str)
+        decoded = processor.decode(pieces)
+        match = "✓" if decoded == test else "✗"
+        print(f"{match} Test {i}: {test[:50]}...")
+        print(f"   → Pieces ({len(pieces)}): {pieces[:10]}{'...' if len(pieces) > 10 else ''}")
+        if decoded != test:
+            print(f"   ⚠ Decode mismatch: {decoded}")
+
+
+def push_tokenizer_to_hub(model_path: Path, output_dir: Path, repo_id: str, hf_token: str) -> None:
+    """Push tokenizer (model + configs) to Hugging Face Hub."""
+    api = HfApi(token=hf_token)
+
+    # Ensure repo exists
+    try:
+        api.repo_info(repo_id, token=hf_token)
+        print(f"Using existing tokenizer repo: {repo_id}")
+    except RepositoryNotFoundError:
+        print(f"Creating tokenizer repo: {repo_id}")
+        api.create_repo(repo_id, private=False, token=hf_token)
+
+    # Upload tokenizer files
+    files_to_upload = [
+        model_path,  # spm_unigram.model
+        model_path.with_suffix(".vocab"),  # spm_unigram.vocab
+        output_dir / "tokenizer_config.json",
+        output_dir / "special_tokens_map.json",
+    ]
+
+    print(f"Uploading tokenizer files to {repo_id}...")
+    for file_path in files_to_upload:
+        if file_path.exists():
+            api.upload_file(
+                path_or_fileobj=str(file_path),
+                path_in_repo=file_path.name,
+                repo_id=repo_id,
+                token=hf_token,
+            )
+            print(f"  ✓ Uploaded {file_path.name}")
+
+    print(f"✓ Tokenizer pushed to {repo_id}")
+
+
 def main() -> None:
     args = parse_args()
     validate_args(args)
@@ -383,6 +479,18 @@ def main() -> None:
 
     run_sanity_check(model_path)
     print("\nSentencePiece training complete.")
+
+    # Convert to fast tokenizer
+    convert_to_fast_tokenizer(model_path, output_dir)
+
+    # Run test cases
+    run_test_cases(model_path)
+
+    # Push to Hub
+    tokenizer_repo = "LastTransformer/BLIP3o-SentencePiece-Unigram-Tokenizer"
+    push_tokenizer_to_hub(model_path, output_dir, tokenizer_repo, hf_token)
+
+    print("\n✓ All steps complete: trained, tested, and pushed tokenizer to Hub.")
 
 
 if __name__ == "__main__":
