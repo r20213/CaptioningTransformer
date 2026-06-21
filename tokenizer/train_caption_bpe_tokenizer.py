@@ -3,11 +3,12 @@
 Train a fast BPE tokenizer for image captioning from a streaming Hugging Face dataset.
 
 Features:
-  - Deterministic virtual split: train=90%, validation=5%, test=5%
-  - Trains only on train partition
+  - Streaming-only, no full dataset materialization
+  - Selective column loading to skip heavy vision/embedding data
+  - Deterministic shuffling with seed-based buffered streaming
   - Numeric-aware pre-tokenization with regex `\\d+`
   - 16,000 vocabulary cap with required special tokens
-  - Streaming iterator to stay memory-safe on constrained machines
+  - Memory-mapped iterator for low-overhead training
   - Exports tokenizer.json, vocab.json, merges.txt into tokenizer/
   - Sanity check for round-trip decode and number token integrity
 """
@@ -15,10 +16,12 @@ Features:
 from __future__ import annotations
 
 import argparse
-import hashlib
 import os
 from pathlib import Path
-from typing import Dict, Iterable, Iterator
+from typing import Iterator
+
+# Set Rust parallelism globally BEFORE importing tokenizers library.
+os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
 # Load tokenizer-specific .env first, then shared preprocessing .env for common vars like HF_TOKEN.
 try:
@@ -113,19 +116,21 @@ def validate_args(args: argparse.Namespace) -> None:
 
 
 def train_caption_batch_iterator(
-    train_dataset,
+    stream_dataset,
     text_column: str,
     batch_size: int,
 ) -> Iterator[list[str]]:
     """
-    Yield batches of text strings from the training dataset.
+    Yield batches of text strings from the streaming dataset iterator.
     This minimizes Python-Rust context switches and saturates the Rust backend.
+    The stream is already shuffled and selected; we just batch it.
     """
     batch = []
-    for row in train_dataset:
-        text_raw = row.get(text_column, "")
+    for row in stream_dataset:
+        # Direct column access on streaming rows
+        text_raw = row.get(text_column) if isinstance(row, dict) else getattr(row, text_column, None)
         if text_raw is not None:
-            text = str(text_raw)
+            text = str(text_raw).strip() if str(text_raw).strip() else None
             if text:
                 batch.append(text)
                 if len(batch) >= batch_size:
@@ -182,10 +187,6 @@ def run_sanity_check(tokenizer: Tokenizer) -> None:
 
 
 def main() -> None:
-    # Set Rust parallelism globally before any tokenizers imports/usage.
-    os.environ["TOKENIZERS_PARALLELISM"] = "true"
-    os.environ["RAYON_NUM_THREADS"] = ""
-
     args = parse_args()
     validate_args(args)
 
@@ -193,28 +194,30 @@ def main() -> None:
     if not hf_token:
         raise ValueError("HF_TOKEN is required in environment/.env")
 
-    # Set thread count after validation.
+    # Set thread count for Rust parallelism (after validation).
     os.environ["RAYON_NUM_THREADS"] = str(args.num_cpus)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load full dataset and perform upfront deterministic split.
-    print(f"Loading dataset {args.dataset_id}...")
+    # Load dataset with streaming=True and select only the text column.
+    # This avoids downloading heavy vision tokens, embeddings, or other metadata.
+    print(f"Loading dataset {args.dataset_id} (streaming, text-only)...")
     source_dataset = load_dataset(
         args.dataset_id,
         split=args.source_split,
+        streaming=True,
         token=hf_token,
-    )
+    ).select_columns([args.text_column])
 
-    # Upfront split: test=10%, then split remainder into train=90% val=10% of remainder.
-    test_split = source_dataset.train_test_split(test_size=0.1, seed=args.seed)
-    train_val_split = test_split["train"].train_test_split(test_size=0.1, seed=args.seed)
-    train_dataset = train_val_split["train"]
-    val_dataset = train_val_split["test"]
-    test_dataset = test_split["test"]
+    # Apply deterministic shuffle with seed-based buffering.
+    # No materialization; streaming uses an in-memory buffer_size for shuffling.
+    shuffled_dataset = source_dataset.shuffle(seed=args.seed, buffer_size=10000)
 
-    print(f"Dataset split: train={len(train_dataset)} val={len(val_dataset)} test={len(test_dataset)}")
+    # For streaming, we train on the entire shuffled stream.
+    # In production, you could add .take(N) if you want to limit rows,
+    # but we train on the full stream for maximum vocabulary coverage.
+    train_stream = shuffled_dataset
 
     tokenizer = build_tokenizer()
     trainer = BpeTrainer(
@@ -225,17 +228,19 @@ def main() -> None:
 
     # Create batch iterator for Rust backend saturation.
     iterator = train_caption_batch_iterator(
-        train_dataset=train_dataset,
+        stream_dataset=train_stream,
         text_column=args.text_column,
         batch_size=args.batch_size,
     )
 
     print(f"Training tokenizer from dataset={args.dataset_id} split={args.source_split}")
-    print(f"Upfront split ratios: train=81% validation=9% test=10% (deterministic seed={args.seed})")
+    print(f"Streaming with deterministic shuffle (seed={args.seed}, buffer_size=10000)")
     print(f"Batch size: {args.batch_size}")
     print(f"Configured CPU threads: {args.num_cpus}")
     print(f"Trainer progress bar enabled: True")
-    tokenizer.train_from_iterator(iterator, trainer=trainer, length=len(train_dataset))
+    print("Starting training (streaming mode, no length pre-computation)...")
+    # Note: length parameter omitted for IterableDataset; trainer uses internal progress.
+    tokenizer.train_from_iterator(iterator, trainer=trainer)
 
     configure_special_token_processing(tokenizer)
 
