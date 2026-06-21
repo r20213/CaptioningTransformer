@@ -272,8 +272,9 @@ def write_training_corpus(train_stream, text_column: str, corpus_path: Path) -> 
 def train_sentencepiece(corpus_path: Path, output_dir: Path, args: argparse.Namespace) -> Path:
     model_prefix = output_dir / "spm_unigram"
 
-    # split_digits=False keeps digit sequences from being forced into per-digit units.
-    # split_by_number=True keeps transitions around numbers explicit.
+    # Keep numeric spans as intact as possible.
+    # - split_digits=False avoids forced per-digit segmentation.
+    # - split_by_number=False avoids explicit number boundary splitting.
     spm.SentencePieceTrainer.train(
         input=str(corpus_path),
         model_prefix=str(model_prefix),
@@ -290,8 +291,9 @@ def train_sentencepiece(corpus_path: Path, output_dir: Path, args: argparse.Name
         bos_piece="[BOS]",
         eos_piece="[EOS]",
         user_defined_symbols=["[MASK]"],
-        split_by_number=True,
+        split_by_number=False,
         split_digits=False,
+        byte_fallback=True, # Added this
     )
 
     return model_prefix.with_suffix(".model")
@@ -314,9 +316,13 @@ def run_sanity_check(model_path: Path) -> None:
         if processor.piece_to_id(tok) < 0:
             raise RuntimeError(f"Missing special token in trained model: {tok}")
 
-    # Best-effort numeric check: verify at least one piece contains digit run.
-    if not any(re.search(r"\d+", piece) for piece in pieces):
-        raise RuntimeError("Numeric chunking check failed: encoded pieces did not preserve digit sequences")
+    expected_atomic_numbers = {"987", "42"}
+    observed_atomic_numbers = {piece.lstrip("▁") for piece in pieces if piece.lstrip("▁").isdigit()}
+    if not expected_atomic_numbers.issubset(observed_atomic_numbers):
+        raise RuntimeError(
+            "Numeric chunking check failed: expected atomic numeric pieces for 987 and 42; "
+            f"got pieces={pieces}"
+        )
 
     if decoded != sample:
         raise RuntimeError("Round-trip check failed: decoded text does not match original")
