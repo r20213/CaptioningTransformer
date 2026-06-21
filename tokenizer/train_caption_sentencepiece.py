@@ -318,7 +318,7 @@ def train_sentencepiece(
 
 def run_sanity_check(model_path: Path) -> None:
     processor = spm.SentencePieceProcessor(model_file=str(model_path))
-    sample = "A caption with number 987 and 42 apples."
+    sample = "A caption with number 87 and 42 apples."
 
     pieces = processor.encode(sample, out_type=str)
     decoded = processor.decode(pieces)
@@ -333,11 +333,11 @@ def run_sanity_check(model_path: Path) -> None:
         if processor.piece_to_id(tok) < 0:
             raise RuntimeError(f"Missing special token in trained model: {tok}")
 
-    expected_atomic_numbers = {"987", "42"}
+    expected_atomic_numbers = {"87", "42"}
     observed_atomic_numbers = {piece for piece in pieces if piece.isdigit()}
     if not expected_atomic_numbers.issubset(observed_atomic_numbers):
         raise RuntimeError(
-            "Numeric chunking check failed: expected atomic numeric pieces for 987 and 42; "
+            "Numeric chunking check failed: expected atomic numeric pieces for 42 and 87; "
             f"got pieces={pieces}"
         )
 
