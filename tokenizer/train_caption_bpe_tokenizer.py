@@ -212,7 +212,7 @@ def main() -> None:
 
     # Apply deterministic shuffle with seed-based buffering.
     # No materialization; streaming uses an in-memory buffer_size for shuffling.
-    shuffled_dataset = source_dataset.shuffle(seed=args.seed, buffer_size=1000)
+    shuffled_dataset = source_dataset.shuffle(seed=args.seed, buffer_size=100)
 
     # For streaming, we train on the entire shuffled stream.
     # In production, you could add .take(N) if you want to limit rows,
@@ -234,7 +234,7 @@ def main() -> None:
     )
 
     print(f"Training tokenizer from dataset={args.dataset_id} split={args.source_split}")
-    print(f"Streaming with deterministic shuffle (seed={args.seed}, buffer_size=10000)")
+    print(f"Streaming with deterministic shuffle (seed={args.seed}, buffer_size=100)")
     print(f"Batch size: {args.batch_size}")
     print(f"Configured CPU threads: {args.num_cpus}")
     print(f"Trainer progress bar enabled: True")
