@@ -55,7 +55,7 @@ def parse_args() -> argparse.Namespace:
         "--source-split",
         type=str,
         default=os.environ.get("TOKENIZER_SOURCE_SPLIT", "train").strip() or "train",
-        help="Source split to stream from dataset repo",
+        help="Source split to load from dataset repo",
     )
     parser.add_argument(
         "--text-column",
@@ -82,10 +82,16 @@ def parse_args() -> argparse.Namespace:
         help="CPU threads for tokenizer training",
     )
     parser.add_argument(
-        "--log-every-rows",
+        "--batch-size",
         type=int,
-        default=int(os.environ.get("TOKENIZER_LOG_EVERY_ROWS", "50000").strip() or "50000"),
-        help="Print streaming progress every N source rows (0 disables)",
+        default=int(os.environ.get("TOKENIZER_BATCH_SIZE", "5000").strip() or "5000"),
+        help="Batch size for training iterator",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=int(os.environ.get("TOKENIZER_SEED", "42").strip() or "42"),
+        help="Random seed for deterministic train/val/test split",
     )
     return parser.parse_args()
 
@@ -97,59 +103,36 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--vocab-size must be > 0")
     if args.num_cpus <= 0:
         raise ValueError("--num-cpus must be > 0")
-    if args.log_every_rows < 0:
-        raise ValueError("--log-every-rows must be >= 0")
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be > 0")
+    if args.seed < 0:
+        raise ValueError("--seed must be >= 0")
 
 
-def split_bucket(example: Dict[str, object]) -> str:
-    key = str(example.get("__key__") or example.get("id") or example.get("txt") or "")
-    digest = hashlib.blake2b(key.encode("utf-8", errors="ignore"), digest_size=8).digest()
-    bucket = int.from_bytes(digest, "big") % 100
-    if bucket < 90:
-        return "train"
-    if bucket < 95:
-        return "validation"
-    return "test"
 
 
-def train_caption_iterator(
-    dataset_id: str,
-    source_split: str,
+
+def train_caption_batch_iterator(
+    train_dataset,
     text_column: str,
-    hf_token: str,
-    counters: Dict[str, int],
-    log_every_rows: int,
-) -> Iterator[str]:
-    stream: Iterable[Dict[str, object]] = load_dataset(
-        dataset_id,
-        split=source_split,
-        streaming=True,
-        token=hf_token,
-    )
-
-    seen_rows = 0
-    for row in stream:
-        seen_rows += 1
-        partition = split_bucket(row)
-        counters[partition] += 1
-
-        if log_every_rows and seen_rows % log_every_rows == 0:
-            print(
-                "[stream] "
-                f"seen={seen_rows} train={counters['train']} "
-                f"validation={counters['validation']} test={counters['test']}"
-            )
-
-        if partition != "train":
-            continue
-
+    batch_size: int,
+) -> Iterator[list[str]]:
+    """
+    Yield batches of text strings from the training dataset.
+    This minimizes Python-Rust context switches and saturates the Rust backend.
+    """
+    batch = []
+    for row in train_dataset:
         text_raw = row.get(text_column, "")
-        if text_raw is None:
-            continue
-
-        text = str(text_raw)
-        if text:
-            yield text
+        if text_raw is not None:
+            text = str(text_raw)
+            if text:
+                batch.append(text)
+                if len(batch) >= batch_size:
+                    yield batch
+                    batch = []
+    if batch:
+        yield batch
 
 
 def build_tokenizer() -> Tokenizer:
@@ -199,6 +182,10 @@ def run_sanity_check(tokenizer: Tokenizer) -> None:
 
 
 def main() -> None:
+    # Set Rust parallelism globally before any tokenizers imports/usage.
+    os.environ["TOKENIZERS_PARALLELISM"] = "true"
+    os.environ["RAYON_NUM_THREADS"] = ""
+
     args = parse_args()
     validate_args(args)
 
@@ -206,12 +193,28 @@ def main() -> None:
     if not hf_token:
         raise ValueError("HF_TOKEN is required in environment/.env")
 
-    # Let tokenizers/rayon use all available constrained vCPUs.
-    os.environ["TOKENIZERS_PARALLELISM"] = "true"
+    # Set thread count after validation.
     os.environ["RAYON_NUM_THREADS"] = str(args.num_cpus)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load full dataset and perform upfront deterministic split.
+    print(f"Loading dataset {args.dataset_id}...")
+    source_dataset = load_dataset(
+        args.dataset_id,
+        split=args.source_split,
+        token=hf_token,
+    )
+
+    # Upfront split: test=10%, then split remainder into train=90% val=10% of remainder.
+    test_split = source_dataset.train_test_split(test_size=0.1, seed=args.seed)
+    train_val_split = test_split["train"].train_test_split(test_size=0.1, seed=args.seed)
+    train_dataset = train_val_split["train"]
+    val_dataset = train_val_split["test"]
+    test_dataset = test_split["test"]
+
+    print(f"Dataset split: train={len(train_dataset)} val={len(val_dataset)} test={len(test_dataset)}")
 
     tokenizer = build_tokenizer()
     trainer = BpeTrainer(
@@ -220,23 +223,19 @@ def main() -> None:
         show_progress=True,
     )
 
-    counters = {"train": 0, "validation": 0, "test": 0}
-    iterator = train_caption_iterator(
-        dataset_id=args.dataset_id,
-        source_split=args.source_split,
+    # Create batch iterator for Rust backend saturation.
+    iterator = train_caption_batch_iterator(
+        train_dataset=train_dataset,
         text_column=args.text_column,
-        hf_token=hf_token,
-        counters=counters,
-        log_every_rows=args.log_every_rows,
+        batch_size=args.batch_size,
     )
 
     print(f"Training tokenizer from dataset={args.dataset_id} split={args.source_split}")
-    print("Virtual split ratios: train=90% validation=5% test=5% (deterministic hash partition)")
+    print(f"Upfront split ratios: train=81% validation=9% test=10% (deterministic seed={args.seed})")
+    print(f"Batch size: {args.batch_size}")
     print(f"Configured CPU threads: {args.num_cpus}")
-    print(f"Trainer progress bar enabled: {True}")
-    if args.log_every_rows:
-        print(f"Streaming logs every {args.log_every_rows} rows")
-    tokenizer.train_from_iterator(iterator, trainer=trainer)
+    print(f"Trainer progress bar enabled: True")
+    tokenizer.train_from_iterator(iterator, trainer=trainer, length=len(train_dataset))
 
     configure_special_token_processing(tokenizer)
 
@@ -248,7 +247,6 @@ def main() -> None:
     print(f"- {tokenizer_json}")
     print(f"- {output_dir / 'vocab.json'}")
     print(f"- {output_dir / 'merges.txt'}")
-    print("Observed partition counts while streaming source split:", counters)
 
     run_sanity_check(tokenizer)
     print("\nTokenizer training complete.")
