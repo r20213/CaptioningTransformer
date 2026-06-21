@@ -212,7 +212,7 @@ def main() -> None:
 
     # Apply deterministic shuffle with seed-based buffering.
     # No materialization; streaming uses an in-memory buffer_size for shuffling.
-    shuffled_dataset = source_dataset.shuffle(seed=args.seed, buffer_size=10000)
+    shuffled_dataset = source_dataset.shuffle(seed=args.seed, buffer_size=1000)
 
     # For streaming, we train on the entire shuffled stream.
     # In production, you could add .take(N) if you want to limit rows,
