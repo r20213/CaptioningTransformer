@@ -63,7 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--text-column",
         type=str,
-        default=os.environ.get("TOKENIZER_TEXT_COLUMN", "txt").strip() or "txt",
+        default=os.environ.get("TOKENIZER_TEXT_COLUMN", "caption").strip() or "caption",
         help="Caption/text column name",
     )
     parser.add_argument(
