@@ -33,9 +33,9 @@ except ImportError:
     pass
 
 from datasets import load_dataset
-from tokenizers import Regex, Tokenizer
+from tokenizers import Regex, Tokenizer, decoders
 from tokenizers.models import BPE
-from tokenizers.pre_tokenizers import Sequence, Split, Whitespace
+from tokenizers.pre_tokenizers import ByteLevel, Sequence, Split
 from tokenizers.processors import TemplateProcessing
 from tokenizers.trainers import BpeTrainer
 
@@ -81,6 +81,12 @@ def parse_args() -> argparse.Namespace:
         default=int(os.environ.get("TOKENIZER_NUM_CPUS", "4").strip() or "4"),
         help="CPU threads for tokenizer training",
     )
+    parser.add_argument(
+        "--log-every-rows",
+        type=int,
+        default=int(os.environ.get("TOKENIZER_LOG_EVERY_ROWS", "50000").strip() or "50000"),
+        help="Print streaming progress every N source rows (0 disables)",
+    )
     return parser.parse_args()
 
 
@@ -91,6 +97,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--vocab-size must be > 0")
     if args.num_cpus <= 0:
         raise ValueError("--num-cpus must be > 0")
+    if args.log_every_rows < 0:
+        raise ValueError("--log-every-rows must be >= 0")
 
 
 def split_bucket(example: Dict[str, object]) -> str:
@@ -110,6 +118,7 @@ def train_caption_iterator(
     text_column: str,
     hf_token: str,
     counters: Dict[str, int],
+    log_every_rows: int,
 ) -> Iterator[str]:
     stream: Iterable[Dict[str, object]] = load_dataset(
         dataset_id,
@@ -118,14 +127,27 @@ def train_caption_iterator(
         token=hf_token,
     )
 
+    seen_rows = 0
     for row in stream:
+        seen_rows += 1
         partition = split_bucket(row)
         counters[partition] += 1
+
+        if log_every_rows and seen_rows % log_every_rows == 0:
+            print(
+                "[stream] "
+                f"seen={seen_rows} train={counters['train']} "
+                f"validation={counters['validation']} test={counters['test']}"
+            )
 
         if partition != "train":
             continue
 
-        text = str(row.get(text_column, "")).strip()
+        text_raw = row.get(text_column, "")
+        if text_raw is None:
+            continue
+
+        text = str(text_raw)
         if text:
             yield text
 
@@ -135,9 +157,11 @@ def build_tokenizer() -> Tokenizer:
     tokenizer.pre_tokenizer = Sequence(
         [
             Split(pattern=Regex(r"\d+"), behavior="isolated"),
-            Whitespace(),
+            # ByteLevel + ByteLevel decoder preserves exact text bytes on decode.
+            ByteLevel(add_prefix_space=False, use_regex=False),
         ]
     )
+    tokenizer.decoder = decoders.ByteLevel()
     return tokenizer
 
 
@@ -154,19 +178,24 @@ def configure_special_token_processing(tokenizer: Tokenizer) -> None:
 
 
 def run_sanity_check(tokenizer: Tokenizer) -> None:
-    sample = "A caption with number 987 and 42 apples."
+    sample = "A caption with number 987\nand 42 apples.  Keep\tspacing."
+
+    pretokenized_chunks = [piece for piece, _ in tokenizer.pre_tokenizer.pre_tokenize_str(sample)]
     encoded = tokenizer.encode(sample)
-    decoded = tokenizer.decode(encoded.ids, skip_special_tokens=False)
+    decoded = tokenizer.decode(encoded.ids, skip_special_tokens=True)
 
     print("\nSanity check")
     print("sample:", sample)
+    print("pretokenized chunks:", pretokenized_chunks)
     print("tokens:", encoded.tokens)
     print("decoded:", decoded)
 
-    if "987" not in encoded.tokens or "42" not in encoded.tokens:
-        raise RuntimeError("Numeric chunking check failed: expected '987' and '42' as standalone tokens")
+    if "987" not in pretokenized_chunks or "42" not in pretokenized_chunks:
+        raise RuntimeError("Numeric chunking check failed: expected pre-tokenizer chunks '987' and '42'")
     if not encoded.tokens or encoded.tokens[0] != "[BOS]" or encoded.tokens[-1] != "[EOS]":
         raise RuntimeError("Special token check failed: expected [BOS] ... [EOS]")
+    if decoded != sample:
+        raise RuntimeError("Round-trip check failed: decoded text does not match original exactly")
 
 
 def main() -> None:
@@ -198,11 +227,15 @@ def main() -> None:
         text_column=args.text_column,
         hf_token=hf_token,
         counters=counters,
+        log_every_rows=args.log_every_rows,
     )
 
     print(f"Training tokenizer from dataset={args.dataset_id} split={args.source_split}")
     print("Virtual split ratios: train=90% validation=5% test=5% (deterministic hash partition)")
     print(f"Configured CPU threads: {args.num_cpus}")
+    print(f"Trainer progress bar enabled: {True}")
+    if args.log_every_rows:
+        print(f"Streaming logs every {args.log_every_rows} rows")
     tokenizer.train_from_iterator(iterator, trainer=trainer)
 
     configure_special_token_processing(tokenizer)
