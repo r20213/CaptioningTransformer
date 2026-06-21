@@ -269,8 +269,25 @@ def write_training_corpus(train_stream, text_column: str, corpus_path: Path) -> 
     return rows_written
 
 
-def train_sentencepiece(corpus_path: Path, output_dir: Path, args: argparse.Namespace) -> Path:
+def build_numeric_symbols() -> list[str]:
+    """Return first 100 natural numbers as user-defined symbols."""
+    return [str(i) for i in range(1, 101)]
+
+
+def train_sentencepiece(
+    corpus_path: Path,
+    output_dir: Path,
+    args: argparse.Namespace,
+    numeric_symbols: list[str],
+) -> Path:
     model_prefix = output_dir / "spm_unigram"
+
+    user_symbols = ["[MASK]"] + numeric_symbols
+    if args.vocab_size <= 4 + len(user_symbols):
+        raise ValueError(
+            "vocab_size is too small for special/user symbols. "
+            f"Need > {4 + len(user_symbols)}, got {args.vocab_size}."
+        )
 
     # Keep numeric spans as intact as possible.
     # - split_digits=False avoids forced per-digit segmentation.
@@ -290,10 +307,10 @@ def train_sentencepiece(corpus_path: Path, output_dir: Path, args: argparse.Name
         unk_piece="[UNK]",
         bos_piece="[BOS]",
         eos_piece="[EOS]",
-        user_defined_symbols=["[MASK]"],
+        user_defined_symbols=user_symbols,
         split_by_number=False,
         split_digits=False,
-        byte_fallback=True, # Added this
+        byte_fallback=False,
     )
 
     return model_prefix.with_suffix(".model")
@@ -317,7 +334,7 @@ def run_sanity_check(model_path: Path) -> None:
             raise RuntimeError(f"Missing special token in trained model: {tok}")
 
     expected_atomic_numbers = {"987", "42"}
-    observed_atomic_numbers = {piece.lstrip("▁") for piece in pieces if piece.lstrip("▁").isdigit()}
+    observed_atomic_numbers = {piece for piece in pieces if piece.isdigit()}
     if not expected_atomic_numbers.issubset(observed_atomic_numbers):
         raise RuntimeError(
             "Numeric chunking check failed: expected atomic numeric pieces for 987 and 42; "
@@ -353,9 +370,11 @@ def main() -> None:
     corpus_path = output_dir / "spm_train_corpus.txt"
     rows_written = write_training_corpus(train_stream, args.text_column, corpus_path)
     print(f"Training corpus rows written: {rows_written}")
+    numeric_symbols = build_numeric_symbols()
+    print(f"Registered numeric user symbols: {len(numeric_symbols)} (1-100)")
 
     print("Training SentencePiece unigram model...")
-    model_path = train_sentencepiece(corpus_path, output_dir, args)
+    model_path = train_sentencepiece(corpus_path, output_dir, args, numeric_symbols)
     vocab_path = model_path.with_suffix(".vocab")
 
     print("\nSaved tokenizer files:")
