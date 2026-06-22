@@ -91,12 +91,14 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("TOKENIZER_REPO_ID", "").strip(),
     )
     parser.add_argument("--train-examples", type=int, default=100)
-    parser.add_argument("--steps", type=int, default=500)
+    parser.add_argument("--steps", type=int, default=2000)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--max-text-len", type=int, default=96)
     parser.add_argument("--max-gen-len", type=int, default=64)
     parser.add_argument("--num-infer", type=int, default=12)
+    parser.add_argument("--repetition-penalty", type=float, default=1.3,
+                        help="Multiplicative penalty on logits of already-generated tokens (>1 discourages repeats)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--device",
@@ -365,6 +367,7 @@ def generate_caption(
     image_tokens: torch.Tensor,
     max_gen_len: int,
     device: torch.device,
+    repetition_penalty: float = 1.3,
 ) -> str:
     model.eval()
     generated = [tokenizer.bos_id]
@@ -378,7 +381,18 @@ def generate_caption(
             attn_mask = torch.cat([image_mask, text_mask], dim=1)
 
             outputs = model(image_tokens=image_batch, text_tokens=text_input, attention_mask=attn_mask)
-            next_logits = outputs.logits[0, image_batch.shape[1] + text_input.shape[1] - 1]
+            next_logits = outputs.logits[0, image_batch.shape[1] + text_input.shape[1] - 1].clone()
+
+            # Repetition penalty: divide positive logits and multiply negative logits
+            # for tokens already in the generated sequence, discouraging loops.
+            if repetition_penalty != 1.0 and generated:
+                seen = torch.tensor(list(set(generated)), dtype=torch.long, device=device)
+                next_logits[seen] = torch.where(
+                    next_logits[seen] > 0,
+                    next_logits[seen] / repetition_penalty,
+                    next_logits[seen] * repetition_penalty,
+                )
+
             next_id = int(torch.argmax(next_logits).item())
             generated.append(next_id)
             if next_id == tokenizer.eos_id:
@@ -629,8 +643,14 @@ img { max-width: 240px; height: auto; border-radius: 4px; }
 
         for sample_id, generated, actual, image_path, source_path, _ in joined:
             if image_path and Path(image_path).exists():
-                rel_image = os.path.relpath(image_path, start=output_dir)
-                image_html = f"<img src='{html.escape(rel_image)}' alt='image'/>"
+                try:
+                    rel_image = os.path.relpath(image_path, start=output_dir)
+                    # Normalise to forward slashes so browsers can resolve the path.
+                    rel_image = rel_image.replace("\\", "/")
+                    image_html = f"<img src='{html.escape(rel_image)}' alt='image'/>"
+                except ValueError:
+                    # relpath raises ValueError on Windows when paths are on different drives.
+                    image_html = f"<div class='small'>{html.escape(source_path or 'image missing')}</div>"
             else:
                 image_html = f"<div class='small'>{html.escape(source_path or 'image missing')}</div>"
 
@@ -716,6 +736,7 @@ def main() -> None:
             image_tokens=ex.image_tokens,
             max_gen_len=args.max_gen_len,
             device=device,
+            repetition_penalty=args.repetition_penalty,
         )
         infer_rows.append(
             InferenceRow(
