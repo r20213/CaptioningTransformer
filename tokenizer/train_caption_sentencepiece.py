@@ -368,8 +368,18 @@ def convert_to_fast_tokenizer(model_path: Path, output_dir: Path) -> Path:
     # Build the Rust-backed Unigram tokenizer matching SentencePiece behavior.
     backend = Tokenizer(Unigram(vocab, unk_id=unk_id))
     backend.normalizer = normalizers.Sequence([NFKC()])
-    backend.pre_tokenizer = Metaspace(replacement="\u2581", add_prefix_space=True)
-    backend.decoder = decoders.Metaspace(replacement="\u2581", add_prefix_space=True)
+
+    # Metaspace's prefix-space arg differs across `tokenizers` versions:
+    #   - older: add_prefix_space=True
+    #   - newer: prepend_scheme="always"
+    def _make_metaspace(factory):
+        try:
+            return factory(replacement="\u2581", prepend_scheme="always")
+        except TypeError:
+            return factory(replacement="\u2581", add_prefix_space=True)
+
+    backend.pre_tokenizer = _make_metaspace(Metaspace)
+    backend.decoder = _make_metaspace(decoders.Metaspace)
 
     fast_tokenizer = PreTrainedTokenizerFast(
         tokenizer_object=backend,
