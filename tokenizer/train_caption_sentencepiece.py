@@ -347,31 +347,48 @@ def run_sanity_check(model_path: Path) -> None:
 
 def convert_to_fast_tokenizer(model_path: Path, output_dir: Path) -> Path:
     """
-    Convert SentencePiece .model to a fast tokenizer with proper tokenizer.json.
-    Uses transformers.SentencePieceTokenizer to generate real Rust-serialized artifacts.
+    Convert SentencePiece .model to a fast tokenizer with tokenizer.json.
+    Uses the tokenizers library to create Rust-serialized fast artifacts.
     """
-    from transformers import SentencePieceTokenizer
     import json
+
+    try:
+        from tokenizers import Tokenizer
+        from tokenizers.models import SentencePiece
+    except ImportError as exc:
+        raise ImportError(
+            "Fast tokenizer conversion requires 'tokenizers' library. "
+            "Install with: pip install tokenizers"
+        ) from exc
 
     processor = spm.SentencePieceProcessor(model_file=str(model_path))
     vocab_size = processor.vocab_size()
 
-    # Create a SentencePieceTokenizer wrapper that transformers understands.
-    tok = SentencePieceTokenizer(str(model_path))
+    # Create a Rust-based fast tokenizer with SentencePiece backend.
+    model = SentencePiece(str(model_path))
+    tokenizer = Tokenizer(model)
 
-    # Set special token IDs (matching what was trained).
-    tok.pad_token_id = 0
-    tok.unk_token_id = 1
-    tok.bos_token_id = 2
-    tok.eos_token_id = 3
+    # Configure special tokens.
+    special_token_map = {
+        "[PAD]": 0,
+        "[UNK]": 1,
+        "[BOS]": 2,
+        "[EOS]": 3,
+        "[MASK]": 4,
+    }
+    for token, token_id in special_token_map.items():
+        tokenizer.add_special_tokens([token])
+
+    # Save as tokenizer.json (standard fast tokenizer format).
+    tokenizer_json_path = output_dir / "tokenizer.json"
+    tokenizer.save(str(tokenizer_json_path))
 
     # Create tokenizer_config.json for transformers.
     tokenizer_config = {
-        "tokenizer_class": "SentencePieceTokenizer",
+        "tokenizer_class": "AutoTokenizer",
         "model_type": "sentencepiece",
         "vocab_size": vocab_size,
         "language": "en",
-        "legacy": False,
     }
     config_path = output_dir / "tokenizer_config.json"
     with config_path.open("w", encoding="utf-8") as f:
@@ -389,7 +406,10 @@ def convert_to_fast_tokenizer(model_path: Path, output_dir: Path) -> Path:
     with special_map_path.open("w", encoding="utf-8") as f:
         json.dump(special_tokens, f, indent=2)
 
-    print(f"\nCreated fast tokenizer config: {config_path}, {special_map_path}")
+    print(f"\nCreated fast tokenizer artifacts:")
+    print(f"- {tokenizer_json_path} (Rust-serialized fast tokenizer)")
+    print(f"- {config_path}")
+    print(f"- {special_map_path}")
     print(f"Tokenizer ready for fast loading with AutoTokenizer(use_fast=True)")
     return config_path
 
@@ -431,10 +451,11 @@ def push_tokenizer_to_hub(model_path: Path, output_dir: Path, repo_id: str, hf_t
         print(f"Creating tokenizer repo: {repo_id}")
         api.create_repo(repo_id, private=False, token=hf_token)
 
-    # Upload tokenizer files: SentencePiece model + transformers configs
+    # Upload tokenizer files: SentencePiece model + transformers configs + fast tokenizer.json
     files_to_upload = [
         model_path,  # spm_unigram.model (SentencePiece binary)
         model_path.with_suffix(".vocab"),  # spm_unigram.vocab (vocabulary)
+        output_dir / "tokenizer.json",  # Fast tokenizer (Rust-serialized)
         output_dir / "tokenizer_config.json",  # HF tokenizer config
         output_dir / "special_tokens_map.json",  # HF special tokens
     ]
