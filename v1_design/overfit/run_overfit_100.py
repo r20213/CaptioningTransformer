@@ -552,7 +552,15 @@ def fetch_images_with_duckdb(
         )
 
     image_meta_parquet = output_dir / "image_metadata.parquet"
-    pq.write_table(pa.table(meta_rows), image_meta_parquet)
+    pq.write_table(
+        pa.Table.from_pydict({
+            "sample_id": [r["sample_id"] for r in meta_rows],
+            "local_image_path": [r["local_image_path"] for r in meta_rows],
+            "source_image_path": [r["source_image_path"] for r in meta_rows],
+            "source_caption": [r["source_caption"] for r in meta_rows],
+        }),
+        image_meta_parquet,
+    )
     return image_meta_parquet
 
 
