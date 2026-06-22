@@ -133,17 +133,57 @@ class CaptionTokenizer:
     def __init__(self, repo_id: str, hf_token: str):
         from transformers import AutoTokenizer
 
+        self._tok = None
+        
+        # Try fast tokenizer first
         try:
             self._tok = AutoTokenizer.from_pretrained(repo_id, token=hf_token, use_fast=True)
-        except ValueError:
-            # Some repos only expose SentencePiece assets; use slow tokenizer fallback.
-            self._tok = AutoTokenizer.from_pretrained(repo_id, token=hf_token, use_fast=False)
-        self.pad_id = self._tok.pad_token_id if self._tok.pad_token_id is not None else 0
-        self.bos_id = self._tok.bos_token_id if self._tok.bos_token_id is not None else 2
-        self.eos_id = self._tok.eos_token_id if self._tok.eos_token_id is not None else 3
+        except (ValueError, ImportError):
+            pass
+        
+        # Try slow tokenizer if fast fails
+        if self._tok is None:
+            try:
+                self._tok = AutoTokenizer.from_pretrained(repo_id, token=hf_token, use_fast=False)
+            except (ValueError, ImportError):
+                pass
+        
+        # Fall back to direct SentencePiece loading if transformers can't handle it
+        if self._tok is None:
+            try:
+                import sentencepiece as spm
+                from huggingface_hub import hf_hub_download
+                
+                model_file = hf_hub_download(
+                    repo_id=repo_id,
+                    filename="spm_unigram.model",
+                    token=hf_token,
+                )
+                self._processor = spm.SentencePieceProcessor(model_file=model_file)
+                self._use_direct_spm = True
+            except ImportError as exc:
+                raise ImportError(
+                    "Could not load tokenizer. Requires: sentencepiece, transformers. "
+                    "Install with: pip install sentencepiece transformers"
+                ) from exc
+        else:
+            self._use_direct_spm = False
+        
+        # Set token IDs
+        if self._use_direct_spm:
+            self.pad_id = 0
+            self.bos_id = 2
+            self.eos_id = 3
+        else:
+            self.pad_id = self._tok.pad_token_id if self._tok.pad_token_id is not None else 0
+            self.bos_id = self._tok.bos_token_id if self._tok.bos_token_id is not None else 2
+            self.eos_id = self._tok.eos_token_id if self._tok.eos_token_id is not None else 3
 
     def encode_caption(self, text: str, max_text_len: int) -> tuple[List[int], List[int]]:
-        core = self._tok.encode(text, add_special_tokens=False)
+        if self._use_direct_spm:
+            core = self._processor.encode(text)
+        else:
+            core = self._tok.encode(text, add_special_tokens=False)
         core = core[: max(1, max_text_len - 2)]
         full = [self.bos_id] + core + [self.eos_id]
         return full[:-1], full[1:]
@@ -156,7 +196,11 @@ class CaptionTokenizer:
             if token_id in (self.pad_id, self.bos_id):
                 continue
             trimmed.append(token_id)
-        return self._tok.decode(trimmed, skip_special_tokens=True).strip()
+        
+        if self._use_direct_spm:
+            return self._processor.decode(trimmed).strip()
+        else:
+            return self._tok.decode(trimmed, skip_special_tokens=True).strip()
 
 
 def load_training_examples(
