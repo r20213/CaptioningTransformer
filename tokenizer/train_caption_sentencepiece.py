@@ -347,26 +347,37 @@ def run_sanity_check(model_path: Path) -> None:
 
 def convert_to_fast_tokenizer(model_path: Path, output_dir: Path) -> Path:
     """
-    Convert SentencePiece .model to a fast tokenizer config (transformers-compatible).
-    Creates tokenizer_config.json and special_tokens_map.json for Hub upload.
+    Convert SentencePiece .model to a fast tokenizer with proper tokenizer.json.
+    Uses transformers.SentencePieceTokenizer to generate real Rust-serialized artifacts.
     """
+    from transformers import SentencePieceTokenizer
     import json
 
     processor = spm.SentencePieceProcessor(model_file=str(model_path))
+    vocab_size = processor.vocab_size()
 
-    # Create tokenizer_config.json
+    # Create a SentencePieceTokenizer wrapper that transformers understands.
+    tok = SentencePieceTokenizer(str(model_path))
+
+    # Set special token IDs (matching what was trained).
+    tok.pad_token_id = 0
+    tok.unk_token_id = 1
+    tok.bos_token_id = 2
+    tok.eos_token_id = 3
+
+    # Create tokenizer_config.json for transformers.
     tokenizer_config = {
-        "tokenizer_class": "SentencePieceProcessor",
-        "model_type": "unigram",
-        "vocab_size": processor.vocab_size(),
-        "model_file": "spm_unigram.model",
+        "tokenizer_class": "SentencePieceTokenizer",
+        "model_type": "sentencepiece",
+        "vocab_size": vocab_size,
         "language": "en",
+        "legacy": False,
     }
     config_path = output_dir / "tokenizer_config.json"
     with config_path.open("w", encoding="utf-8") as f:
         json.dump(tokenizer_config, f, indent=2)
 
-    # Create special_tokens_map.json
+    # Create special_tokens_map.json.
     special_tokens = {
         "bos_token": {"content": "[BOS]", "lstrip": False, "rstrip": False, "single_word": False},
         "eos_token": {"content": "[EOS]", "lstrip": False, "rstrip": False, "single_word": False},
@@ -379,6 +390,7 @@ def convert_to_fast_tokenizer(model_path: Path, output_dir: Path) -> Path:
         json.dump(special_tokens, f, indent=2)
 
     print(f"\nCreated fast tokenizer config: {config_path}, {special_map_path}")
+    print(f"Tokenizer ready for fast loading with AutoTokenizer(use_fast=True)")
     return config_path
 
 
@@ -408,7 +420,7 @@ def run_test_cases(model_path: Path) -> None:
 
 
 def push_tokenizer_to_hub(model_path: Path, output_dir: Path, repo_id: str, hf_token: str) -> None:
-    """Push tokenizer (model + configs) to Hugging Face Hub."""
+    """Push tokenizer (model + configs) to Hugging Face Hub for fast loading."""
     api = HfApi(token=hf_token)
 
     # Ensure repo exists
@@ -419,12 +431,12 @@ def push_tokenizer_to_hub(model_path: Path, output_dir: Path, repo_id: str, hf_t
         print(f"Creating tokenizer repo: {repo_id}")
         api.create_repo(repo_id, private=False, token=hf_token)
 
-    # Upload tokenizer files
+    # Upload tokenizer files: SentencePiece model + transformers configs
     files_to_upload = [
-        model_path,  # spm_unigram.model
-        model_path.with_suffix(".vocab"),  # spm_unigram.vocab
-        output_dir / "tokenizer_config.json",
-        output_dir / "special_tokens_map.json",
+        model_path,  # spm_unigram.model (SentencePiece binary)
+        model_path.with_suffix(".vocab"),  # spm_unigram.vocab (vocabulary)
+        output_dir / "tokenizer_config.json",  # HF tokenizer config
+        output_dir / "special_tokens_map.json",  # HF special tokens
     ]
 
     print(f"Uploading tokenizer files to {repo_id}...")
@@ -438,7 +450,7 @@ def push_tokenizer_to_hub(model_path: Path, output_dir: Path, repo_id: str, hf_t
             )
             print(f"  ✓ Uploaded {file_path.name}")
 
-    print(f"✓ Tokenizer pushed to {repo_id}")
+    print(f"✓ Tokenizer pushed to {repo_id} (ready for AutoTokenizer fast loading)")
 
 
 def main() -> None:

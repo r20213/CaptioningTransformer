@@ -133,7 +133,11 @@ class CaptionTokenizer:
     def __init__(self, repo_id: str, hf_token: str):
         from transformers import AutoTokenizer
 
-        self._tok = AutoTokenizer.from_pretrained(repo_id, token=hf_token, use_fast=True)
+        try:
+            self._tok = AutoTokenizer.from_pretrained(repo_id, token=hf_token, use_fast=True)
+        except ValueError:
+            # Some repos only expose SentencePiece assets; use slow tokenizer fallback.
+            self._tok = AutoTokenizer.from_pretrained(repo_id, token=hf_token, use_fast=False)
         self.pad_id = self._tok.pad_token_id if self._tok.pad_token_id is not None else 0
         self.bos_id = self._tok.bos_token_id if self._tok.bos_token_id is not None else 2
         self.eos_id = self._tok.eos_token_id if self._tok.eos_token_id is not None else 3
