@@ -428,6 +428,65 @@ def run_test_cases(model_path: Path) -> None:
             print(f"   ⚠ Decode mismatch: {decoded}")
 
 
+def run_fertility_check(
+    model_path: Path,
+    text_dataset_repo_id: str,
+    text_column: str,
+    hf_token: str,
+) -> tuple[float, float]:
+    """
+    Measure token fertility (subword tokens per word) over the full train split.
+
+    Streams every caption from the Hub train split saved earlier and computes
+    per-caption fertility = subword pieces / whitespace words. A value near 1.0
+    means words stay mostly intact; higher values mean more subword splitting.
+    Returns (median, mean).
+    """
+    import statistics
+
+    processor = spm.SentencePieceProcessor(model_file=str(model_path))
+
+    train_stream = load_dataset(
+        text_dataset_repo_id,
+        split="train",
+        streaming=True,
+        token=hf_token,
+    ).select_columns([text_column])
+
+    print(f"\nToken fertility check over full train split ({text_dataset_repo_id})...")
+    fertilities: list[float] = []
+    total_words = 0
+    total_pieces = 0
+    for row in tqdm(train_stream, desc="Measuring fertility"):
+        text_raw = row.get(text_column, "")
+        if text_raw is None:
+            continue
+        text = str(text_raw)
+        num_words = len(text.split())
+        if num_words == 0:
+            continue
+        num_pieces = len(processor.encode(text, out_type=str))
+        fertilities.append(num_pieces / num_words)
+        total_words += num_words
+        total_pieces += num_pieces
+
+    if not fertilities:
+        raise RuntimeError("No captions found in train split for fertility measurement.")
+
+    median_fertility = statistics.median(fertilities)
+    mean_fertility = statistics.fmean(fertilities)
+    corpus_fertility = total_pieces / total_words if total_words else 0.0
+    print(
+        f"\nFertility summary over {len(fertilities)} captions: "
+        f"median={median_fertility:.4f} mean={mean_fertility:.4f}"
+    )
+    print(
+        f"Corpus-level fertility (total pieces / total words): {corpus_fertility:.4f} "
+        f"(pieces={total_pieces}, words={total_words})"
+    )
+    return median_fertility, mean_fertility
+
+
 def push_tokenizer_to_hub(model_path: Path, output_dir: Path, repo_id: str, hf_token: str) -> None:
     """Push tokenizer (model + configs) to Hugging Face Hub for fast loading."""
     api = HfApi(token=hf_token)
@@ -508,6 +567,9 @@ def main() -> None:
 
     # Run test cases
     run_test_cases(model_path)
+
+    # Measure token fertility over the full text-only train split on the Hub
+    run_fertility_check(model_path, args.text_dataset_repo_id, args.text_column, hf_token)
 
     # Push to Hub
     tokenizer_repo = "LastTransformer/BLIP3o-SentencePiece-Unigram-Tokenizer"
