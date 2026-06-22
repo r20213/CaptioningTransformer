@@ -36,7 +36,7 @@ SRC_DIR = V1_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from model_blueprint import CaptioningTransformerV1
+from src.model_blueprint import CaptioningTransformerV1
 
 
 def _load_env_files() -> None:

@@ -1,0 +1,60 @@
+"""Public API for the V1 captioning model stack."""
+
+from .config_schema import (
+	BudgetSpec,
+	ModelSpec,
+	OptimizerSpec,
+	ProjectorSpec,
+	TrainingSpec,
+	V1Spec,
+	VisualSpec,
+	validate_spec,
+)
+from .model_blueprint import (
+	CaptioningTransformerV1,
+	ForwardOutputs,
+	ParamCountSummary,
+	QKNorm,
+	RMSNorm,
+	TransformerBlockV1,
+	VisualProjector,
+	apply_rope_1d,
+	build_v1_model,
+	count_parameters,
+	create_captioning_mask,
+	format_param_count,
+	summarize_parameters,
+)
+from .optim_groups import OptimizerGroups, build_optimizer_groups, count_params, summarize_groups
+from .param_budget import BudgetReport, estimate_v1_params, format_report
+
+__all__ = [
+	"BudgetReport",
+	"BudgetSpec",
+	"CaptioningTransformerV1",
+	"ForwardOutputs",
+	"ModelSpec",
+	"OptimizerGroups",
+	"OptimizerSpec",
+	"ParamCountSummary",
+	"ProjectorSpec",
+	"QKNorm",
+	"RMSNorm",
+	"TrainingSpec",
+	"TransformerBlockV1",
+	"V1Spec",
+	"VisualProjector",
+	"VisualSpec",
+	"apply_rope_1d",
+	"build_optimizer_groups",
+	"build_v1_model",
+	"count_parameters",
+	"count_params",
+	"create_captioning_mask",
+	"estimate_v1_params",
+	"format_param_count",
+	"format_report",
+	"summarize_groups",
+	"summarize_parameters",
+	"validate_spec",
+]
