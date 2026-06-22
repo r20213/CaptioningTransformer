@@ -494,91 +494,32 @@ def fetch_images_with_duckdb(
     output_dir: Path,
     parquet_urls_json: str,
 ) -> Path:
-    from huggingface_hub import HfApi, hf_hub_download
-
-    sql_templates = _load_sql_templates()
-
-    # Discover parquet filenames for this split from the Hub repo (no remote query).
-    api = HfApi(token=hf_token)
-    all_files = sorted(api.list_repo_files(repo_id=dataset_id, repo_type="dataset"))
-    split_files = [
-        f for f in all_files
-        if f.endswith(".parquet") and (f"/{split}/" in f or f.startswith(f"{split}/"))
-    ]
-    if not split_files:
-        # Fallback: any parquet file in the repo.
-        split_files = [f for f in all_files if f.endswith(".parquet")]
-    if not split_files:
-        raise RuntimeError(f"No parquet files found in {dataset_id} for split={split}")
-
-    # Download parquet files locally one at a time; stop early once all sample_ids are found.
-    local_cache = output_dir / "parquet_cache"
-    local_cache.mkdir(parents=True, exist_ok=True)
-
+    # Stream the raw dataset and match on __key__ == sample_id.
+    # The raw dataset has no parquet export; images live in the 'jpg' column.
     wanted_set = set(sample_ids)
-    local_paths: List[str] = []
+    rows: List[Dict[str, Any]] = []
 
-    print(f"  Downloading parquet shards from {dataset_id} (split={split}) locally...")
-    for repo_filename in split_files:
-        local_path = str(
-            hf_hub_download(
-                repo_id=dataset_id,
-                filename=repo_filename,
-                repo_type="dataset",
-                token=hf_token,
-                local_dir=str(local_cache),
-            )
-        )
-        local_paths.append(local_path)
-
-        # Check whether all wanted sample_ids now exist in the downloaded shards.
-        ids_literal = ", ".join(f"'{sid}'" for sid in wanted_set)
-        paths_repr = repr(local_paths)
-        probe_con = duckdb.connect()
-        found_ids = {
-            row[0]
-            for row in probe_con.execute(
-                f"SELECT DISTINCT sample_id FROM read_parquet({paths_repr}) "
-                f"WHERE sample_id IN ({ids_literal})"
-            ).fetchall()
-        }
-        probe_con.close()
-        if found_ids >= wanted_set:
-            print(f"  All {len(wanted_set)} sample_ids located after {len(local_paths)} shard(s).")
+    print(f"  Streaming {dataset_id} (split={split}) to fetch images by __key__...")
+    stream = load_dataset(dataset_id, split=split, streaming=True, token=hf_token)
+    for row in stream:
+        key = str(row.get("__key__", "")).strip()
+        if key not in wanted_set:
+            continue
+        jpg_obj = row.get("jpg")
+        image_bytes: Optional[bytes] = None
+        if isinstance(jpg_obj, bytes):
+            image_bytes = jpg_obj
+        elif isinstance(jpg_obj, dict):
+            raw = jpg_obj.get("bytes")
+            image_bytes = bytes(raw) if raw is not None else None
+        rows.append({"sample_id": key, "image_bytes": image_bytes})
+        wanted_set.discard(key)
+        if not wanted_set:
+            print(f"  All {len(sample_ids)} images found.")
             break
 
-    # Build the DuckDB connection over local files only (no httpfs needed).
-    parquet_paths_sql = ", ".join("'" + p.replace("'", "''") + "'" for p in local_paths)
-
-    con = duckdb.connect()
-    wanted = pa.table({"sample_id": sample_ids})
-    con.register("wanted_ids", wanted)
-
-    struct_sql = sql_templates["sample_rows_struct_extract"].format(parquet_urls_sql=parquet_paths_sql)
-    fallback_sql = sql_templates["sample_rows_direct_jpg"].format(parquet_urls_sql=parquet_paths_sql)
-
-    rows: List[Dict[str, Any]] = []
-    try:
-        for sample_id, caption, image_bytes, image_path in con.execute(struct_sql).fetchall():
-            rows.append(
-                {
-                    "sample_id": str(sample_id),
-                    "source_caption": str(caption or ""),
-                    "image_bytes": bytes(image_bytes) if image_bytes is not None else None,
-                    "source_image_path": str(image_path or ""),
-                }
-            )
-    except Exception:
-        for sample_id, caption, jpg_obj in con.execute(fallback_sql).fetchall():
-            image_bytes, image_path = _parse_jpg_obj(jpg_obj)
-            rows.append(
-                {
-                    "sample_id": str(sample_id),
-                    "source_caption": str(caption or ""),
-                    "image_bytes": image_bytes,
-                    "source_image_path": str(image_path or ""),
-                }
-            )
+    if wanted_set:
+        print(f"  Warning: {len(wanted_set)} sample_id(s) not found in stream: {list(wanted_set)[:5]}")
 
     image_dir = output_dir / "images"
     image_dir.mkdir(parents=True, exist_ok=True)
@@ -589,28 +530,13 @@ def fetch_images_with_duckdb(
     for sample_id in sample_ids:
         row = by_id.get(sample_id)
         local_path = ""
-        source_path = ""
-        source_caption = ""
 
         if row is not None:
-            source_path = str(row.get("source_image_path", ""))
-            source_caption = str(row.get("source_caption", ""))
             image_bytes = row.get("image_bytes")
-
             if image_bytes:
                 image_path = image_dir / f"{sample_id}.jpg"
                 try:
                     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-                    img.save(image_path)
-                    local_path = str(image_path)
-                except Exception:
-                    local_path = ""
-            elif source_path.startswith("http://") or source_path.startswith("https://"):
-                image_path = image_dir / f"{sample_id}.jpg"
-                try:
-                    r = requests.get(source_path, timeout=45)
-                    r.raise_for_status()
-                    img = Image.open(io.BytesIO(r.content)).convert("RGB")
                     img.save(image_path)
                     local_path = str(image_path)
                 except Exception:
@@ -620,8 +546,8 @@ def fetch_images_with_duckdb(
             {
                 "sample_id": sample_id,
                 "local_image_path": local_path,
-                "source_image_path": source_path,
-                "source_caption": source_caption,
+                "source_image_path": "",
+                "source_caption": "",
             }
         )
 
