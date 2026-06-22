@@ -33,8 +33,8 @@ except ImportError as exc:  # pragma: no cover
 THIS_DIR = Path(__file__).resolve().parent
 V1_ROOT = THIS_DIR.parent
 SRC_DIR = V1_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
+if str(V1_ROOT) not in sys.path:
+    sys.path.insert(0, str(V1_ROOT))
 
 from src.model_blueprint import CaptioningTransformerV1
 
