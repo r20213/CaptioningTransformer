@@ -1,0 +1,60 @@
+version: v1
+name: captioning_transformer_v1
+
+model:
+  vocab_size: 16000
+  embed_dim: 384
+  n_layers: 30
+  tie_word_embeddings: true
+
+  positional_encoding:
+    type: rope_1d
+    sequence_layout: full_multimodal
+
+  attention:
+    type: gqa
+    qk_norm: true
+
+  normalization:
+    type: rmsnorm
+    force_fp32_for_norm_ops: true
+    force_fp32_for_qk_norm_ops: true
+
+  ffn:
+    type: swiglu
+
+  visual:
+    encoder_dim: 768
+    projector:
+      type: mlp
+      layers: [768, 384, 384]
+      activation: gelu
+    modality_type_embeddings: true
+
+training:
+  precision: fp16
+  use_grad_scaler: true
+  gradient_checkpointing: true
+  compile:
+    enabled: true
+    mode: reduce-overhead
+  distributed:
+    strategy: ddp_or_fsdp
+
+optimizer:
+  split:
+    muon_targets: dense_weight_matrices_rank_ge_2
+    adamw_targets:
+      - embeddings
+      - norms
+      - biases
+      - visual_projection
+
+budget:
+  target_total_params_millions: 60.0
+  expected_total_params_millions: 59.7
+
+notes:
+  excluded_from_v1:
+    - sft_dora
+    - dpo_dora

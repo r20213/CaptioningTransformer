@@ -1,0 +1,28 @@
+sample_rows_struct_extract: |
+  SELECT
+      __key__ AS sample_id,
+      txt AS caption,
+      jpg['bytes'] AS image_bytes,
+      jpg['path'] AS image_path
+  FROM read_parquet([{parquet_urls_sql}])
+  WHERE __key__ IN (SELECT sample_id FROM wanted_ids)
+
+sample_rows_direct_jpg: |
+  SELECT
+      __key__ AS sample_id,
+      txt AS caption,
+      jpg AS jpg_obj
+  FROM read_parquet([{parquet_urls_sql}])
+  WHERE __key__ IN (SELECT sample_id FROM wanted_ids)
+
+join_predictions_with_images: |
+  SELECT
+      p.sample_id,
+      p.generated_caption,
+      p.actual_caption,
+      m.local_image_path,
+      m.source_image_path,
+      m.source_caption
+  FROM read_parquet('{predictions_parquet}') p
+  LEFT JOIN read_parquet('{image_meta_parquet}') m USING (sample_id)
+  ORDER BY p.sample_id
