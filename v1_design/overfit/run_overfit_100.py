@@ -494,24 +494,68 @@ def fetch_images_with_duckdb(
     output_dir: Path,
     parquet_urls_json: str,
 ) -> Path:
+    from huggingface_hub import HfApi, hf_hub_download
+
     sql_templates = _load_sql_templates()
-    parquet_urls = _hf_parquet_urls(
-        dataset_id=dataset_id,
-        split=split,
-        hf_token=hf_token,
-        parquet_urls_json=parquet_urls_json,
-    )
-    parquet_urls_sql = ", ".join("'" + url.replace("'", "''") + "'" for url in parquet_urls)
+
+    # Discover parquet filenames for this split from the Hub repo (no remote query).
+    api = HfApi(token=hf_token)
+    all_files = sorted(api.list_repo_files(repo_id=dataset_id, repo_type="dataset"))
+    split_files = [
+        f for f in all_files
+        if f.endswith(".parquet") and (f"/{split}/" in f or f.startswith(f"{split}/"))
+    ]
+    if not split_files:
+        # Fallback: any parquet file in the repo.
+        split_files = [f for f in all_files if f.endswith(".parquet")]
+    if not split_files:
+        raise RuntimeError(f"No parquet files found in {dataset_id} for split={split}")
+
+    # Download parquet files locally one at a time; stop early once all sample_ids are found.
+    local_cache = output_dir / "parquet_cache"
+    local_cache.mkdir(parents=True, exist_ok=True)
+
+    wanted_set = set(sample_ids)
+    local_paths: List[str] = []
+
+    print(f"  Downloading parquet shards from {dataset_id} (split={split}) locally...")
+    for repo_filename in split_files:
+        local_path = str(
+            hf_hub_download(
+                repo_id=dataset_id,
+                filename=repo_filename,
+                repo_type="dataset",
+                token=hf_token,
+                local_dir=str(local_cache),
+            )
+        )
+        local_paths.append(local_path)
+
+        # Check whether all wanted sample_ids now exist in the downloaded shards.
+        ids_literal = ", ".join(f"'{sid}'" for sid in wanted_set)
+        paths_repr = repr(local_paths)
+        probe_con = duckdb.connect()
+        found_ids = {
+            row[0]
+            for row in probe_con.execute(
+                f"SELECT DISTINCT sample_id FROM read_parquet({paths_repr}) "
+                f"WHERE sample_id IN ({ids_literal})"
+            ).fetchall()
+        }
+        probe_con.close()
+        if found_ids >= wanted_set:
+            print(f"  All {len(wanted_set)} sample_ids located after {len(local_paths)} shard(s).")
+            break
+
+    # Build the DuckDB connection over local files only (no httpfs needed).
+    parquet_paths_sql = ", ".join("'" + p.replace("'", "''") + "'" for p in local_paths)
 
     con = duckdb.connect()
-    con.execute("INSTALL httpfs")
-    con.execute("LOAD httpfs")
-
     wanted = pa.table({"sample_id": sample_ids})
     con.register("wanted_ids", wanted)
 
-    struct_sql = sql_templates["sample_rows_struct_extract"].format(parquet_urls_sql=parquet_urls_sql)
-    fallback_sql = sql_templates["sample_rows_direct_jpg"].format(parquet_urls_sql=parquet_urls_sql)
+    struct_sql = sql_templates["sample_rows_struct_extract"].format(parquet_urls_sql=parquet_paths_sql)
+    fallback_sql = sql_templates["sample_rows_direct_jpg"].format(parquet_urls_sql=parquet_paths_sql)
 
     rows: List[Dict[str, Any]] = []
     try:
