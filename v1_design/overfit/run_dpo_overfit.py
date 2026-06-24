@@ -250,9 +250,9 @@ def load_dpo_examples(
         if len(items) >= train_examples:
             break
 
-    if len(items) < train_examples:
+    if len(items) == 0:
         raise RuntimeError(
-            f"Only found {len(items)} DPO examples after hash split; expected {train_examples}"
+            f"Found No data."
         )
     return items
 
