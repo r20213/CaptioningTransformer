@@ -11,7 +11,11 @@ from v1_design.overfit.run_overfit_100 import load_training_examples
 
 import sys
 from pathlib import Path
-sys.path.append(str(Path(__file__).resolve().parent.parent))
+
+# Add the project root (/kaggle/working/CaptioningTransformer) to sys.path
+# This makes 'src' importable
+project_root = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(project_root))
 
 def generate_dpo_pairs(checkpoint_path: str, args: argparse.Namespace):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
