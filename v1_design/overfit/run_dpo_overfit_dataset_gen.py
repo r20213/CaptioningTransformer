@@ -2,20 +2,17 @@
 import argparse
 import json
 import os
+import sys
 import torch
 from tqdm import tqdm
+# Get the absolute path to the parent directory
+parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
 
 from src import CaptioningTransformerV1
 from run_dpo_overfit import CaptionTokenizer, generate_caption
-from v1_design.overfit.run_overfit_100 import load_training_examples 
-
-import sys
-from pathlib import Path
-
-# Add the project root (/kaggle/working/CaptioningTransformer) to sys.path
-# This makes 'src' importable
-project_root = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(project_root))
+from run_overfit_100 import load_training_examples 
 
 def generate_dpo_pairs(checkpoint_path: str, args: argparse.Namespace):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
