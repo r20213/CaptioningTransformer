@@ -4,7 +4,9 @@ import json
 import os
 import sys
 import torch
+import torch.nn as nn
 from tqdm import tqdm
+
 # Get the absolute path to the parent directory
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if parent_dir not in sys.path:
@@ -15,24 +17,43 @@ from run_dpo_overfit import CaptionTokenizer, generate_caption
 from run_overfit_100 import load_training_examples 
 from huggingface_hub import login
 from dotenv import load_dotenv
+
 load_dotenv()  # Load environment variables from .env file
 
 def generate_dpo_pairs(checkpoint_path: str, args: argparse.Namespace):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # 1. HF Authentication before everything else
     hf_token = os.environ.get("HF_TOKEN", "").strip()
+    if hf_token:
+        login(token=hf_token)
+    else:
+        print("Warning: HF_TOKEN not found in environment. Proceeding without explicit login.")
+
+    # 2. Setup Multi-GPU Device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    num_gpus = torch.cuda.device_count()
+    print(f"Using device: {device}. Number of available GPUs: {num_gpus}")
     
-    # Initialize Tokenizer
+    # 3. Initialize Tokenizer
     tokenizer = CaptionTokenizer(repo_id=args.tokenizer_repo_id, hf_token=hf_token)
     
-    # Initialize and Load Model
+    # 4. Initialize and Load Model
     model = CaptioningTransformerV1(
         vocab_size=16000, embed_dim=384, n_layers=30, n_heads=12,
         n_kv_heads=4, use_gradient_checkpointing=False, qk_norm=True
     )
-    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
-    model.to(device).eval()
+    
+    # Load state dict on CPU first to prevent GPU 0 OOM, then transfer
+    state_dict = torch.load(checkpoint_path, map_location="cpu")
+    model.load_state_dict(state_dict)
+    model.to(device)
+    model.eval()
 
-    # Load Data
+    # 5. Wrap model with DataParallel if multiple GPUs exist
+    if num_gpus > 1:
+        print(f"Wrapping model in DataParallel across {num_gpus} GPUs.")
+        model = nn.DataParallel(model)
+
+    # 6. Load Data
     data = load_training_examples(
         encoded_dataset_id=args.encoded_dataset_id,
         split=args.split,
@@ -42,22 +63,49 @@ def generate_dpo_pairs(checkpoint_path: str, args: argparse.Namespace):
         tokenizer=tokenizer,
     )
     
-    # Generate Pairs
+    # Limit dataset to the targeted slice
+    dataset_slice = data[:100]
+    
+    # 7. Generate Pairs (Batched to make use of both GPUs)
+    # Set batch size to match or be a multiple of your GPU count
+    batch_size = max(2, num_gpus) 
+    
+    print(f"Generating captions with a batch size of {batch_size}...")
     with open("dpo_dataset.jsonl", "w") as f:
-        for ex in tqdm(data[:100]):
-            chosen = generate_caption(model, tokenizer, ex.image_tokens, 64, device, repetition_penalty=1.05)
-            rejected = generate_caption(model, tokenizer, ex.image_tokens, 64, device, repetition_penalty=0.5)
+        for i in tqdm(range(0, len(dataset_slice), batch_size)):
+            batch = dataset_slice[i:i + batch_size]
             
-            if chosen == rejected:
-                rejected = "This image is unidentifiable." 
+            # Stack tokens along a new batch dimension
+            # Assumes ex.image_tokens is a 1D tensor of patches
+            batch_image_tokens = torch.stack([ex.image_tokens for ex in batch]).to(device)
+            
+            # generate_caption handles the forward pass under the hood.
+            # nn.DataParallel splits this batch across your GPUs automatically.
+            chosen_batch = generate_caption(model, tokenizer, batch_image_tokens, 64, device, repetition_penalty=1.05)
+            rejected_batch = generate_caption(model, tokenizer, batch_image_tokens, 64, device, repetition_penalty=0.5)
+            
+            # If your generate_caption function returns a single string instead of a list when batched, 
+            # wrap them back into a list to keep the iteration consistent:
+            if isinstance(chosen_batch, str):
+                chosen_batch = [chosen_batch]
+            if isinstance(rejected_batch, str):
+                rejected_batch = [rejected_batch]
+
+            # Write batch results to jsonl
+            for idx, ex in enumerate(batch):
+                chosen = chosen_batch[idx] if idx < len(chosen_batch) else ""
+                rejected = rejected_batch[idx] if idx < len(rejected_batch) else ""
                 
-            json.dump({
-                "sample_id": ex.sample_id,
-                "patch_tokens": ex.image_tokens.tolist(),
-                "chosen": chosen,
-                "rejected": rejected
-            }, f)
-            f.write("\n")
+                if chosen == rejected:
+                    rejected = "This image is unidentifiable." 
+                    
+                json.dump({
+                    "sample_id": ex.sample_id,
+                    "patch_tokens": ex.image_tokens.tolist(),
+                    "chosen": chosen,
+                    "rejected": rejected
+                }, f)
+                f.write("\n")
 
     print("Dataset saved to dpo_dataset.jsonl")
 
@@ -67,7 +115,7 @@ if __name__ == "__main__":
     # Required arguments
     parser.add_argument("--checkpoint-path", type=str, required=True, help="Path to .pt file")
     
-    # Data loading arguments (matching your previous usage)
+    # Data loading arguments
     parser.add_argument("--encoded-dataset-id", type=str, default=os.environ.get("HF_DATASET_REPO_ID", ""))
     parser.add_argument("--train-examples", type=int, default=100)
     parser.add_argument("--max-text-len", type=int, default=96)
