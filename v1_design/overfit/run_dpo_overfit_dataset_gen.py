@@ -86,7 +86,7 @@ def generate_dpo_pairs(checkpoint_path: str, args: argparse.Namespace):
             image_tokens = ex.image_tokens.to(current_device)
             
             # Generate options utilizing the specific GPU model instance
-            chosen = generate_caption(current_model, tokenizer, image_tokens, 64, current_device, repetition_penalty=1.05)
+            chosen = ex.caption  # Use the original caption as the chosen one
             rejected = generate_caption(current_model, tokenizer, image_tokens, 64, current_device, repetition_penalty=0.5)
             
             if chosen == rejected:
