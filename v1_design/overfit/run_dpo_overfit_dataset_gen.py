@@ -54,10 +54,23 @@ def generate_dpo_pairs(checkpoint_path: str, args: argparse.Namespace):
     print("Dataset saved to dpo_dataset.jsonl")
 
 if __name__ == "__main__":
-    # Add an argument for the checkpoint path!
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint-path", type=str, required=True)
-    # ... add your existing args here ...
+    parser = argparse.ArgumentParser(description="Generate DPO preference pairs")
+    
+    # Required arguments
+    parser.add_argument("--checkpoint-path", type=str, required=True, help="Path to .pt file")
+    
+    # Data loading arguments (matching your previous usage)
+    parser.add_argument("--encoded-dataset-id", type=str, default=os.environ.get("HF_DATASET_REPO_ID", ""))
+    parser.add_argument("--train-examples", type=int, default=100)
+    parser.add_argument("--max-text-len", type=int, default=96)
+    parser.add_argument("--split", type=str, default="train")
+    parser.add_argument("--tokenizer-repo-id", type=str, default=os.environ.get("TOKENIZER_REPO_ID", ""))
+    
     args = parser.parse_args()
     
+    # Validate missing inputs
+    if not args.encoded_dataset_id or not args.tokenizer_repo_id:
+        print("Error: --encoded-dataset-id and --tokenizer-repo-id must be provided or set via ENV vars.")
+        exit(1)
+        
     generate_dpo_pairs(args.checkpoint_path, args)
