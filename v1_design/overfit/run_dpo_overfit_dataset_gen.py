@@ -13,6 +13,8 @@ if parent_dir not in sys.path:
 from src import CaptioningTransformerV1
 from run_dpo_overfit import CaptionTokenizer, generate_caption
 from run_overfit_100 import load_training_examples 
+from dotenv import load_dotenv
+load_dotenv()  # Load environment variables from .env file
 
 def generate_dpo_pairs(checkpoint_path: str, args: argparse.Namespace):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
