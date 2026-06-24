@@ -9,6 +9,10 @@ from src import CaptioningTransformerV1
 from run_dpo_overfit import CaptionTokenizer, generate_caption
 from v1_design.overfit.run_overfit_100 import load_training_examples 
 
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+
 def generate_dpo_pairs(checkpoint_path: str, args: argparse.Namespace):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     hf_token = os.environ.get("HF_TOKEN", "").strip()
