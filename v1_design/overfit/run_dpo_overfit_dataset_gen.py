@@ -4,7 +4,7 @@ import json
 import os
 import sys
 import torch
-import torch.nn as nn
+import copy
 from tqdm import tqdm
 
 # Get the absolute path to the parent directory
@@ -21,37 +21,42 @@ from dotenv import load_dotenv
 load_dotenv()  # Load environment variables from .env file
 
 def generate_dpo_pairs(checkpoint_path: str, args: argparse.Namespace):
-    # 1. HF Authentication before everything else
+    # 1. Force HF Authentication before everything else downloads
     hf_token = os.environ.get("HF_TOKEN", "").strip()
     if hf_token:
         login(token=hf_token)
     else:
         print("Warning: HF_TOKEN not found in environment. Proceeding without explicit login.")
 
-    # 2. Setup Multi-GPU Device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # 2. Setup Available GPUs
     num_gpus = torch.cuda.device_count()
-    print(f"Using device: {device}. Number of available GPUs: {num_gpus}")
+    print(f"Number of available GPUs detected: {num_gpus}")
     
     # 3. Initialize Tokenizer
     tokenizer = CaptionTokenizer(repo_id=args.tokenizer_repo_id, hf_token=hf_token)
     
-    # 4. Initialize and Load Model
-    model = CaptioningTransformerV1(
+    # 4. Initialize Base Model
+    base_model = CaptioningTransformerV1(
         vocab_size=16000, embed_dim=384, n_layers=30, n_heads=12,
         n_kv_heads=4, use_gradient_checkpointing=False, qk_norm=True
     )
     
-    # Load state dict on CPU first to prevent GPU 0 OOM, then transfer
+    # Load state dict on CPU first to avoid GPU 0 memory spikes
     state_dict = torch.load(checkpoint_path, map_location="cpu")
-    model.load_state_dict(state_dict)
-    model.to(device)
-    model.eval()
+    base_model.load_state_dict(state_dict)
+    base_model.eval()
 
-    # 5. Wrap model with DataParallel if multiple GPUs exist
-    if num_gpus > 1:
-        print(f"Wrapping model in DataParallel across {num_gpus} GPUs.")
-        model = nn.DataParallel(model)
+    # 5. Distribute clones of the model to available devices
+    models_pool = {}
+    if num_gpus >= 2:
+        print("Distributing model replicas across 2 GPUs to balance the workload...")
+        models_pool[0] = copy.deepcopy(base_model).to("cuda:0")
+        models_pool[1] = copy.deepcopy(base_model).to("cuda:1")
+        del base_model # Free up the base CPU architecture memory
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Fallback to single device execution on: {device}")
+        models_pool[0] = base_model.to(device)
 
     # 6. Load Data
     data = load_training_examples(
@@ -63,49 +68,37 @@ def generate_dpo_pairs(checkpoint_path: str, args: argparse.Namespace):
         tokenizer=tokenizer,
     )
     
-    # Limit dataset to the targeted slice
-    dataset_slice = data[:100]
-    
-    # 7. Generate Pairs (Batched to make use of both GPUs)
-    # Set batch size to match or be a multiple of your GPU count
-    batch_size = max(2, num_gpus) 
-    
-    print(f"Generating captions with a batch size of {batch_size}...")
+    # 7. Generate Pairs (Alternating between GPUs to leverage both)
+    print("Generating DPO preference pairs...")
     with open("dpo_dataset.jsonl", "w") as f:
-        for i in tqdm(range(0, len(dataset_slice), batch_size)):
-            batch = dataset_slice[i:i + batch_size]
+        for idx, ex in enumerate(tqdm(data[:100])):
             
-            # Stack tokens along a new batch dimension
-            # Assumes ex.image_tokens is a 1D tensor of patches
-            batch_image_tokens = torch.stack([ex.image_tokens for ex in batch]).to(device)
-            
-            # generate_caption handles the forward pass under the hood.
-            # nn.DataParallel splits this batch across your GPUs automatically.
-            chosen_batch = generate_caption(model, tokenizer, batch_image_tokens, 64, device, repetition_penalty=1.05)
-            rejected_batch = generate_caption(model, tokenizer, batch_image_tokens, 64, device, repetition_penalty=0.5)
-            
-            # If your generate_caption function returns a single string instead of a list when batched, 
-            # wrap them back into a list to keep the iteration consistent:
-            if isinstance(chosen_batch, str):
-                chosen_batch = [chosen_batch]
-            if isinstance(rejected_batch, str):
-                rejected_batch = [rejected_batch]
+            # Alternate target execution device based on item index loop
+            if num_gpus >= 2:
+                gpu_id = idx % 2
+                current_device = torch.device(f"cuda:{gpu_id}")
+                current_model = models_pool[gpu_id]
+            else:
+                current_device = next(models_pool[0].parameters()).device
+                current_model = models_pool[0]
 
-            # Write batch results to jsonl
-            for idx, ex in enumerate(batch):
-                chosen = chosen_batch[idx] if idx < len(chosen_batch) else ""
-                rejected = rejected_batch[idx] if idx < len(rejected_batch) else ""
+            # Put target patch tokens on the active execution GPU
+            image_tokens = ex.image_tokens.to(current_device)
+            
+            # Generate options utilizing the specific GPU model instance
+            chosen = generate_caption(current_model, tokenizer, image_tokens, 64, current_device, repetition_penalty=1.05)
+            rejected = generate_caption(current_model, tokenizer, image_tokens, 64, current_device, repetition_penalty=0.5)
+            
+            if chosen == rejected:
+                rejected = "This image is unidentifiable." 
                 
-                if chosen == rejected:
-                    rejected = "This image is unidentifiable." 
-                    
-                json.dump({
-                    "sample_id": ex.sample_id,
-                    "patch_tokens": ex.image_tokens.tolist(),
-                    "chosen": chosen,
-                    "rejected": rejected
-                }, f)
-                f.write("\n")
+            json.dump({
+                "sample_id": ex.sample_id,
+                "patch_tokens": ex.image_tokens.tolist(), # Keeps original format
+                "chosen": chosen,
+                "rejected": rejected
+            }, f)
+            f.write("\n")
 
     print("Dataset saved to dpo_dataset.jsonl")
 
