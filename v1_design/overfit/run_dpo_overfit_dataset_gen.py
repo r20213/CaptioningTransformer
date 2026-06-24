@@ -87,7 +87,7 @@ def generate_dpo_pairs(checkpoint_path: str, args: argparse.Namespace):
             
             # Generate options utilizing the specific GPU model instance
             chosen = ex.caption  # Use the original caption as the chosen one
-            rejected = generate_caption(current_model, tokenizer, image_tokens, 64, current_device, repetition_penalty=0.5)
+            rejected = generate_caption(current_model, tokenizer, image_tokens, 64, current_device, repetition_penalty=1.15)
             
             if chosen == rejected:
                 rejected = "This image is unidentifiable." 
