@@ -5,7 +5,7 @@ import os
 import torch
 from tqdm import tqdm
 
-from src.model_blueprint import CaptioningTransformerV1
+from src import CaptioningTransformerV1
 from run_dpo_overfit import CaptionTokenizer, generate_caption
 from v1_design.overfit.run_overfit_100 import load_training_examples 
 
